@@ -16,10 +16,16 @@ autoremove_candidates=()
 autoremove_estimate=0
 upgrade_options=(--no-remove -o APT::Get::AutomaticRemove=false --with-new-pkgs)
 journal_limit=$((100 * 1024 * 1024))
+rsyslog_size_mib=100
+rsyslog_archive_count=4
+rsyslog_custom=0
+docker_log_mib=10
+docker_log_files=3
 maintenance_state=/var/lib/server-auditor
 journal_dropin=/etc/systemd/journald.conf.d/90-server-auditor.conf
 rsyslog_rule=/etc/logrotate.d/rsyslog
 logrotate_config=/etc/logrotate.conf
+logrotate_rules_directory=/etc/logrotate.d
 
 usage() {
     printf '%s\n' "Server Auditor v$VERSION" "$(message 'Использование' 'Usage')" \
@@ -33,6 +39,63 @@ has() { command -v "$1" >/dev/null 2>&1; }
 
 message() {
     if [[ $language == en ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi
+}
+
+# Stable action IDs are shared by navigation and report hints.
+declare -A menu_parent=() menu_number=() menu_ru=() menu_en=() menu_action=() menu_items=()
+register_menu_item() {
+    local id=$1 parent=$2
+    menu_parent[$id]=$parent menu_number[$id]=$3 menu_ru[$id]=$4 menu_en[$id]=$5 menu_action[$id]=${6:-}
+    menu_items[$parent]="${menu_items[$parent]:-} $id"
+}
+register_menu_item overview root 1 'Сводка с подробностями по разделам' 'Overview with section details' overview
+register_menu_item update root 2 'Обновить пакеты' 'Update packages' update
+register_menu_item full-audit root 3 'Подробный аудит системы' 'Detailed system audit' audit
+register_menu_item maintenance root 4 'Обслуживание системы' 'System maintenance'
+register_menu_item cleanup-plan maintenance 1 'План освобождения места' 'Disk space recovery plan' cleanup-plan
+register_menu_item packages maintenance 2 'Пакеты APT и ядра' 'APT packages and kernels'
+register_menu_item logs maintenance 3 'Журналы и ротация' 'Logs and rotation'
+register_menu_item docker maintenance 4 'Docker' 'Docker'
+register_menu_item history-menu maintenance 5 'История и восстановление' 'History and restoration'
+register_menu_item clean packages 1 'Очистить кэш APT' 'Clear APT cache' clean
+register_menu_item autoremove packages 2 'Проверить ненужные зависимости' 'Review unused dependencies' autoremove
+register_menu_item kernel packages 3 'Удалить одно старое ядро' 'Remove one old kernel' kernel
+register_menu_item orphan-kernel packages 4 'Очистить связанные пакеты удалённого ядра' 'Clean leftover kernel packages' orphan-kernel
+register_menu_item journal logs 1 'Системный журнал journald' 'System journal (journald)'
+register_menu_item regular-logs logs 2 'Обычные логи — logrotate' 'Regular logs — logrotate'
+register_menu_item docker-logs logs 3 'Журналы Docker' 'Docker logs'
+register_menu_item archives logs 4 'Архивы логов' 'Log archives'
+register_menu_item log-history logs 5 'Общая история и восстановление' 'Shared history and restoration' @history-menu
+register_menu_item journal-status journal 1 'Текущее состояние и объём' 'Current settings and usage' journal-status
+register_menu_item limit journal 2 'Настроить постоянный лимит' 'Configure persistent size limit' limit
+register_menu_item rotate journal 3 'Ротировать без очистки' 'Rotate without cleanup' rotate
+register_menu_item vacuum journal 4 'Очистить старые записи до выбранного объёма' 'Vacuum old entries to selected size' vacuum
+register_menu_item rotation-status regular-logs 1 'Текущие правила и ограничения' 'Current rules and size controls' rotation-status
+register_menu_item logrotate-editor regular-logs 2 'Изменить выбранное правило' 'Edit selected rule' logrotate-editor
+register_menu_item rsyslog-policy regular-logs 3 'Настроить профиль rsyslog' 'Configure rsyslog profile' rsyslog-policy
+register_menu_item logrotate regular-logs 4 'Показать план и запустить ротацию' 'Preview and run rotation' logrotate
+register_menu_item logrotate-guide regular-logs 5 'Инструкция для ручной настройки' 'Manual configuration guide' logrotate-guide
+register_menu_item docker-log-status docker-logs 1 'Контейнеры, объём и ограничения логов' 'Containers, log usage and limits' docker-log-status
+register_menu_item compose-logging docker-logs 2 'Настроить и применить лимиты Compose' 'Configure and apply Compose limits' compose-logging
+register_menu_item archive-plan archives 1 'Найти архив: проверить, перенести или удалить' 'Find an archive: review, move or remove' cleanup-plan
+register_menu_item archive archives 2 'Перенести архив по указанному пути' 'Move an archive by path' archive
+register_menu_item docker-status docker 1 'Состояние контейнеров и использование места' 'Container status and disk usage' docker-log-status
+register_menu_item docker-cleanup docker 2 'Очистить образы и кэш сборки' 'Clean images and build cache' docker-cleanup
+register_menu_item docker-logging-link docker 3 'Настройка журналов Docker' 'Docker log settings' @docker-logs
+register_menu_item docker-images docker-cleanup 1 'Проверить и удалить неиспользуемый образ' 'Review and remove an unused image'
+register_menu_item docker-cache docker-cleanup 2 'Очистить кэш локального Docker Engine' 'Clean local Docker Engine build cache'
+register_menu_item history history-menu 1 'История операций' 'Operation history' history
+register_menu_item restore-config history-menu 2 'Восстановить конфигурацию' 'Restore a configuration' restore-config
+
+menu_title() { message "${menu_ru[$1]}" "${menu_en[$1]}"; }
+menu_path() {
+    local id=$1 path='' depth=0
+    while [[ $id != root ]]; do
+        [[ -n ${menu_number[$id]:-} ]] && ((depth < 12)) || return 2
+        path="${menu_number[$id]}${path:+ → $path}"
+        id=${menu_parent[$id]}; ((depth+=1))
+    done
+    printf '%s' "$path"
 }
 
 colors_enabled() {
@@ -78,8 +141,10 @@ json_string() {
 
 # Callers supply static text, validated fields, or shell-quoted paths.
 record() {
-    local section=$1 status=$2 message=$3
+    local section=$1 status=$2 message=$3 hint=${5:-}
     if [[ $language == en ]]; then message=${4:-$3}; fi
+    if [[ $language == en ]]; then hint=${6:-${5:-}}; fi
+    if [[ $format == txt && -n $hint ]]; then message+=" · [$hint]"; fi
     case $status in
         WARN) ((warnings+=1)) ;;
         CRIT) ((critical+=1)) ;;
@@ -105,6 +170,7 @@ record() {
         printf '    {"section":'; json_string "$section"
         printf ',"status":'; json_string "$status"
         printf ',"message":'; json_string "$message"
+        if [[ -n $hint ]]; then printf ',"hint":'; json_string "$hint"; fi
         printf '}'
     else
         printf '[%-7s] %s\n' "$status" "$message"
@@ -157,7 +223,8 @@ apt_check() {
         overview_note "Обновлений: $upgraded · новых пакетов: $installed · отложено: $kept" \
             "Upgrades: $upgraded · new packages: $installed · kept back: $kept"
         if (( upgraded || installed || kept )); then
-            record apt WARN "План по локальным индексам: обновить $upgraded, установить $installed, отложить $kept" "Cached upgrade plan: upgraded=$upgraded new=$installed kept=$kept"
+            record apt WARN "План по локальным индексам: обновить $upgraded, установить $installed, отложить $kept" "Cached upgrade plan: upgraded=$upgraded new=$installed kept=$kept" \
+                "Обновление пакетов: главное меню → $(menu_path update)" "Update packages: main menu → $(menu_path update)"
         else
             record apt OK 'По локальным индексам обновлений нет' 'Cached upgrade plan: no upgrades'
         fi
@@ -179,8 +246,9 @@ cleanup_check() {
     if result=$(find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' \
         -printf '%b\n' 2>/dev/null | awk '{n++; b+=$1} END {printf "%d %.0f", n,b*512}') &&
         read -r archives bytes <<< "$result"; then
-        record cleanup INFO "Стандартный кэш APT: файлов $archives, занято $bytes байт. Команда apt-get clean очищает скачанные архивы" \
-            "Default APT archive cache: files=$archives allocated_bytes=$bytes; apt-get clean clears downloaded archives"
+        record cleanup INFO "Стандартный кэш APT: файлов $archives, занято $(human_bytes "$bytes"). Команда apt-get clean очищает скачанные архивы" \
+            "Default APT archive cache: files=$archives allocated_bytes=$bytes; apt-get clean clears downloaded archives" \
+            "Очистить кэш: $(menu_path clean). Установленные пакеты сохранятся" "Clear cache: $(menu_path clean). Installed packages are kept"
     else
         record cleanup UNKNOWN 'Не удалось измерить стандартный кэш APT' 'Could not measure the default APT archive cache'
     fi
@@ -215,11 +283,18 @@ cleanup_check() {
             ((unknown_sizes+=1))
         fi
         if (( details )); then
-            record cleanup INFO "Кандидат на удаление: $package. Размер по dpkg: $kib КиБ" "APT removal candidate: $package installed_KiB=$kib"
+            local displayed_size
+            if [[ $kib == unknown ]]; then displayed_size='неизвестен'; else displayed_size=$(human_kib "$kib"); fi
+            record cleanup INFO "Кандидат на удаление: $package. Размер по dpkg: $displayed_size" "APT removal candidate: $package installed_KiB=$kib"
         fi
     done
     autoremove_estimate=$total
-    record cleanup INFO "План apt-get autoremove: кандидатов $count, оценка $total КиБ, неизвестных размеров $unknown_sizes. Проверьте план перед удалением" "APT autoremove simulation: candidates=$count estimated_installed_KiB=$total unknown_sizes=$unknown_sizes; review before removal"
+    local cleanup_hint_ru='Удалять зависимости не требуется' cleanup_hint_en='No dependency cleanup needed'
+    if (( count )); then
+        cleanup_hint_ru="Проверить удаление: $(menu_path autoremove). Для ядер: $(menu_path kernel), связанные пакеты: $(menu_path orphan-kernel)"
+        cleanup_hint_en="Review removal: $(menu_path autoremove). Kernels: $(menu_path kernel), leftover packages: $(menu_path orphan-kernel)"
+    fi
+    record cleanup INFO "План apt-get autoremove: кандидатов $count, оценка $(human_kib "$total"), неизвестных размеров $unknown_sizes. Проверьте план перед удалением" "APT autoremove simulation: candidates=$count estimated_installed_KiB=$total unknown_sizes=$unknown_sizes; review before removal" "$cleanup_hint_ru" "$cleanup_hint_en"
     overview_note "Кандидатов на очистку APT: $count" "APT cleanup candidates: $count"
 }
 
@@ -254,7 +329,8 @@ disk_check() {
             printf -v label "$(message 'Точка монтирования %q' 'mount %q')" "$mount"
         fi
         status=$(usage_status "$blocks")
-        record disk "$status" "$label: занято $blocks%, доступно $free байт из $total" "$label: blocks_used=$blocks% available_bytes=$free total_bytes=$total"
+        record disk "$status" "$label: занято $blocks%, доступно $(human_bytes "$free") из $(human_bytes "$total")" "$label: blocks_used=$blocks% available_bytes=$free total_bytes=$total" \
+            "Проверить крупные файлы: $(menu_path cleanup-plan). Не каждый файл можно удалить" "Review large files: $(menu_path cleanup-plan). Not every file is removable"
         if [[ $inodes =~ ^([0-9]+)%$ ]]; then
             inodes=${inodes%\%}
             record disk "$(usage_status "$inodes")" "$label: занято $inodes% inode" "$label: inodes_used=$inodes%"
@@ -301,12 +377,15 @@ journal_config() {
     for key in SystemMaxUse RuntimeMaxUse; do
         value=${settings[$key]:-}
         if [[ -z $value ]]; then
-            record journald WARN "Для $key действует значение systemd по умолчанию. Лимит 100 МиБ явно не задан" "$key uses the systemd default; 100 MiB cap is not explicit"
+            record journald WARN "Для $key действует значение systemd по умолчанию. Лимит 100 МиБ явно не задан" "$key uses the systemd default; 100 MiB cap is not explicit" \
+                "Настроить лимит: $(menu_path limit)" "Configure limit: $(menu_path limit)"
         elif bytes=$(size_bytes "$value") && [[ $bytes =~ ^[0-9]{1,18}$ ]]; then
             if (( bytes > 0 && bytes <= journal_limit )); then
-                record journald OK "$key=$bytes байт" "$key=$bytes bytes"
+                record journald OK "$key=$(human_bytes "$bytes")" "$key=$bytes bytes" \
+                    "Лимит настроен. Изменить: $(menu_path limit)" "Limit configured. Change: $(menu_path limit)"
             else
-                record journald WARN "$key=$bytes байт. Порог аудита: положительный лимит до 100 МиБ" "$key=$bytes bytes; expected a positive cap up to 100 MiB"
+                record journald WARN "$key=$(human_bytes "$bytes"). Порог аудита: положительный лимит до 100 МиБ" "$key=$bytes bytes; expected a positive cap up to 100 MiB" \
+                    "Настроить лимит: $(menu_path limit)" "Configure limit: $(menu_path limit)"
             fi
         else
             record journald UNKNOWN "Не удалось разобрать $key" "$key could not be interpreted"
@@ -341,9 +420,11 @@ journal_check() {
             [[ $result =~ ^[0-9]{1,18}$ ]]; then
             bytes=$result
             if (( bytes > journal_limit )); then
-                record journald WARN "$directory: занято $bytes байт, выше 100 МиБ" "$directory: allocated_bytes=$bytes, above 100 MiB"
+                record journald WARN "$directory: занято $(human_bytes "$bytes"), выше 100 МиБ" "$directory: allocated_bytes=$bytes, above 100 MiB" \
+                    "Очистить старые записи: $(menu_path vacuum). Они будут потеряны; настроить лимит: $(menu_path limit)" "Delete old entries: $(menu_path vacuum). Entries will be lost; configure limit: $(menu_path limit)"
             else
-                record journald OK "$directory: занято $bytes байт" "$directory: allocated_bytes=$bytes"
+                record journald OK "$directory: занято $(human_bytes "$bytes")" "$directory: allocated_bytes=$bytes" \
+                    'Срочная очистка не требуется' 'No urgent cleanup needed'
             fi
         else
             record journald UNKNOWN "$directory: не удалось измерить объём" "$directory: disk usage inaccessible"
@@ -351,37 +432,135 @@ journal_check() {
     done
 }
 
+logrotate_rule_text() {
+    local entry=$1 number
+    if [[ $entry =~ [[:cntrl:]] ]]; then printf -v entry '%q' "$entry"; fi
+    if [[ $language == ru ]]; then
+        entry=${entry// monthly / ежемесячно }
+        entry=${entry// weekly / еженедельно }
+        entry=${entry// daily / ежедневно }
+        entry=${entry// yearly / ежегодно }
+        entry=${entry// hourly / ежечасно }
+        while [[ $entry =~ after\ ([0-9]+)\ days ]]; do
+            number=${BASH_REMATCH[1]}
+            entry=${entry/"${BASH_REMATCH[0]}"/"период: $number сут."}
+        done
+        entry=${entry//rotations/архивов}
+        entry=${entry//rotation)/архивов)}
+        entry=${entry//(1 архивов)/(1 архив)}
+        entry=${entry//(2 архивов)/(2 архива)}
+        entry=${entry//(3 архивов)/(3 архива)}
+        entry=${entry//(4 архивов)/(4 архива)}
+        entry=${entry//empty log files are not rotated/пустые логи пропускаются}
+        entry=${entry//empty log files are rotated/пустые логи ротируются}
+        entry=${entry//only log files >=/только файлы размером от}
+        entry=${entry//log files >=/файлы размером от}
+        entry=${entry//are rotated earlier/ротируются раньше срока}
+        entry=${entry//bytes are rotated/байт ротируются}
+        entry=${entry//old logs are removed/старые архивы удаляются по правилу хранения}
+        while [[ $entry =~ ([0-9]+)\ bytes ]]; do
+            number=${BASH_REMATCH[1]}
+            entry=${entry/"${BASH_REMATCH[0]}"/"$(human_bytes "$number")"}
+        done
+        while [[ $entry =~ ([0-9]+)\ байт ]]; do
+            number=${BASH_REMATCH[1]}
+            entry=${entry/"${BASH_REMATCH[0]}"/"$(human_bytes "$number")"}
+            ((number >= 1024)) || break
+        done
+    fi
+    printf '%s' "$entry"
+}
+
+logrotate_capacity_report() {
+    local result=$1 kind header='' entry number=0 threshold=0 time_only=0 unrecognized=0
+    local bytes retention status note bounded=0 title policy description hint_ru hint_en separator
+    while IFS=$'\t' read -r kind entry; do
+        if [[ $kind == rule ]]; then
+            header=$entry
+            ((number+=1))
+            continue
+        fi
+        bytes=; retention=
+        if [[ $header =~ \(([0-9]+)\ rotations?\) ]]; then retention=${BASH_REMATCH[1]}; fi
+        # minsize ("only log files >=") is a lower bound, not a size cap.
+        if [[ $entry =~ log\ files\ \>=\ ([0-9]+)\ are\ rotated\ earlier ]]; then
+            bytes=${BASH_REMATCH[1]}
+        elif [[ $header =~ (^|[[:space:]])([0-9]+)\ bytes && $header != *'after '* &&
+            $header != *'daily'* && $header != *'weekly'* && $header != *'monthly'* &&
+            $header != *'yearly'* && $entry != *'only log files >='* ]]; then
+            bytes=${BASH_REMATCH[2]}
+        fi
+        if [[ -n $bytes ]]; then
+            ((threshold+=1))
+            if [[ -n $retention ]]; then ((bounded+=1)); fi
+            note=$(message "Есть порог ротации $(human_bytes "$bytes"); это не жёсткий предел размера." \
+                "Rotation threshold $(human_bytes "$bytes"); this is not a hard size cap.")
+        elif [[ $header == *'after '* || $header == *'daily'* || $header == *'weekly'* ||
+            $header == *'monthly'* || $header == *'yearly'* || $header == *'hourly'* ]]; then
+            ((time_only+=1))
+            note=$(message 'Порог максимального размера не обнаружен. Период и число архивов не ограничивают объём в байтах.' \
+                'No maximum-size rotation threshold detected. Period and archive count do not cap bytes.')
+        else
+            ((unrecognized+=1))
+            note=$(message 'Условия ограничения размера не распознаны; проверьте конфигурацию.' \
+                'Size control conditions unrecognized; check the configuration.')
+        fi
+        if (( details )); then
+            title=$(logrotate_rule_text "$header")
+            policy=$(logrotate_rule_text "$entry")
+            policy=${policy:-$(message 'не распознаны' 'not recognized')}
+            hint_ru="Редактор стандартных блоков: $(menu_path logrotate-editor) (поддержка проверяется перед записью); инструкция: $(menu_path logrotate-guide); ротация: $(menu_path logrotate)"
+            hint_en="Standard-block editor: $(menu_path logrotate-editor) (support checked before writing); guide: $(menu_path logrotate-guide); rotation: $(menu_path logrotate)"
+            if [[ " $header " == *' /var/log/syslog '* && -f $rsyslog_rule && ! -L $rsyslog_rule ]] &&
+                (rsyslog_custom=1; rsyslog_policy "$rsyslog_rule" >/dev/null); then
+                hint_ru="Через скрипт: $(menu_path rsyslog-policy), размер и число архивов штатного rsyslog; проверить через $(menu_path logrotate)"
+                hint_en="Via script: $(menu_path rsyslog-policy), size and archive count for standard rsyslog; validate via $(menu_path logrotate)"
+            fi
+            separator='; '
+            if [[ $format == txt ]]; then separator=$'\n         '; fi
+            description="$(message "Правило $number: $title" "Rule $number: $title")"
+            description+="$separator$(message 'Условия: ' 'Conditions: ')$policy"
+            description+="$separator$(message 'Размер: ' 'Size: ')$note"
+            description+="$separator$(message 'Настройка: ' 'Configuration: ')$(message "$hint_ru" "$hint_en")"
+            record logrotate INFO "$description" "$description"
+        fi
+    done < <(logrotate_rule_blocks "$result")
+    status=INFO
+    if (( time_only )); then status=WARN; fi
+    record logrotate "$status" \
+        "Ограничения объёма обычных логов: правил с порогом размера $threshold, из них с распознанным конечным числом архивов $bounded; без обнаруженного порога $time_only; нераспознанных $unrecognized." \
+        "Regular log capacity: size_threshold_rules=$threshold finite_retention_rules=$bounded no_size_threshold_rules=$time_only unrecognized_rules=$unrecognized." \
+        "План ротации: $(menu_path logrotate). Настройка rsyslog: $(menu_path rsyslog-policy); редактор других правил: $(menu_path logrotate-editor); инструкция: $(menu_path logrotate-guide)" \
+        "Rotation plan: $(menu_path logrotate). Configure rsyslog: $(menu_path rsyslog-policy); other rules editor: $(menu_path logrotate-editor); guide: $(menu_path logrotate-guide)"
+    record logrotate INFO \
+        'Общий предел обычных логов не подтверждён. Logrotate не задаёт общий бюджет /var/log: файлы растут между запусками, шаблоны могут охватывать несколько файлов, а часть логов может не входить в правила. Сумма порогов не является общим лимитом.' \
+        'A total regular-log cap is not established. Logrotate does not enforce a shared /var/log budget: files grow between runs, patterns may cover multiple files, and some logs may be unmanaged. Thresholds cannot be summed into a total cap.'
+    overview_note "Правил без обнаруженного порога размера: $time_only; общий предел не подтверждён" \
+        "Rules without a detected size threshold: $time_only; total cap not established"
+}
+
+logrotate_rule_blocks() {
+    awk '
+        function flush() { if (header != "") { print "rule\t" header; print "policy\t" policy }; header=""; policy="" }
+        /^rotating pattern:/ { flush(); sub(/^rotating pattern: */, ""); header=$0; collecting=1; next }
+        collecting && /^(empty log files|only log files|log files|old logs)/ {
+            policy=policy (policy == "" ? "" : "; ") $0; next
+        }
+        collecting && /^[[:space:]]*($|considering log|Creating|switching|error:|warning:)/ { collecting=0; next }
+        collecting && policy == "" { header=header " " $0 }
+        END { flush() }
+    ' <<< "$1"
+}
+
 logrotate_check() {
-    local result rules entry
+    local result rules entry kind rule_number=0
     if ! has logrotate; then
         record logrotate SKIP 'logrotate недоступен' 'logrotate unavailable'
-    elif result=$(logrotate --debug --state /dev/null /etc/logrotate.conf 2>&1); then
+    elif result=$(logrotate --debug --state /dev/null "$logrotate_config" 2>&1); then
         rules=$(awk '/^rotating pattern:/ {n++} END {print n+0}' <<< "$result")
         record logrotate OK "Пробный запуск прошёл. Правил ротации: $rules. Срок хранения зависит от правила" "Dry run succeeded: rotation_rules=$rules; each rule has its own retention policy"
         overview_note "Правил ротации: $rules" "Rotation rules: $rules"
-        if (( details )); then
-            while IFS= read -r entry; do
-                [[ $entry == 'rotating pattern: '* || $entry == *'log files >= '* ]] || continue
-                if [[ $language == ru ]]; then
-                    if [[ $entry == 'rotating pattern: '* ]]; then
-                        entry="Правило ротации: ${entry#rotating pattern: }"
-                        entry=${entry// monthly / ежемесячно }
-                        entry=${entry// weekly / еженедельно }
-                        entry=${entry// daily / ежедневно }
-                        entry=${entry// yearly / ежегодно }
-                        entry=${entry// rotations)/ ротаций)}
-                    else
-                        entry=${entry//empty log files are not rotated/пустые логи пропускаются}
-                        entry=${entry//empty log files are rotated/пустые логи ротируются}
-                        entry=${entry//only log files >=/только файлы размером от}
-                        entry=${entry//bytes are rotated/байт ротируются}
-                        entry=${entry//old logs are removed/старые логи удаляются}
-                    fi
-                fi
-                if [[ $entry =~ [[:cntrl:]] ]]; then printf -v entry '%q' "$entry"; fi
-                record logrotate INFO "$entry"
-            done <<< "$result"
-        fi
+        logrotate_capacity_report "$result"
     else
         record logrotate UNKNOWN 'Пробный запуск завершился ошибкой. Проверьте конфигурацию и права доступа' 'Dry run failed; check configuration and permissions locally'
     fi
@@ -411,7 +590,8 @@ large_logs_check() {
         read -r files bytes large <<< "$result"; then
         local status=OK
         if (( large )); then status=WARN; fi
-        record logrotate "$status" "/var/log: файлов $files, суммарный размер $bytes байт, файлов свыше 100 МиБ: $large (без journal)" "/var/log: files=$files apparent_bytes=$bytes files_over_100MiB=$large (excluding journal)"
+        record logrotate "$status" "/var/log: файлов $files, суммарный размер $(human_bytes "$bytes"), файлов свыше 100 МиБ: $large (без journal)" "/var/log: files=$files apparent_bytes=$bytes files_over_100MiB=$large (excluding journal)" \
+            "Проверить файлы и архивы: $(menu_path cleanup-plan); ротация: $(menu_path logrotate)" "Review files and archives: $(menu_path cleanup-plan); rotation: $(menu_path logrotate)"
         overview_note "Файлов свыше 100 МиБ: $large из $files" "Files over 100 MiB: $large of $files"
     else
         record logrotate UNKNOWN 'Не удалось проверить все файлы в /var/log' 'Could not inventory all files under /var/log'
@@ -433,7 +613,9 @@ large_logs_check() {
                         'Rotated syslog: check for open file descriptors before moving it.' ;;
             esac
             printf -v path '%q' "$path"
-            record logrotate WARN "Крупный лог: $bytes байт, путь $path" "Large log: apparent_bytes=$bytes path=$path"
+            record logrotate WARN "Крупный лог: $(human_bytes "$bytes"), путь $path" "Large log: apparent_bytes=$bytes path=$path" \
+                "Текущий лог: ротация $(menu_path logrotate). Поддерживаемый архив: проверка и удаление $(menu_path cleanup-plan)" \
+                "Active log: rotate via $(menu_path logrotate). Supported archive: review and remove via $(menu_path cleanup-plan)"
             ((shown+=1))
         done < <(
             if find /var/log -xdev \( -path /var/log/journal -prune \) -o \
@@ -517,7 +699,8 @@ container_logging() {
                 max_size=$(size_bytes "$max_size") && [[ $max_size =~ ^[1-9][0-9]*$ ]]; then
                 record docker OK "$ru: ротация $driver, до $max_size байт на файл, файлов до $max_file" "$en: $driver rotation, max_size_bytes=$max_size max_files=$max_file"
             else
-                record docker WARN "$ru: для $driver не удалось подтвердить лимиты размера и числа файлов" "$en: $driver has no verified size and file count limits"
+                record docker WARN "$ru: для $driver не удалось подтвердить лимиты размера и числа файлов" "$en: $driver has no verified size and file count limits" \
+                    "Для Compose с json-file: $(menu_path compose-logging); другие случаи — вручную" "Compose with json-file: $(menu_path compose-logging); other cases require manual configuration"
             fi ;;
         journald) record docker INFO "$ru: драйвер journald. См. раздел journald" "$en: journald driver; see journald checks" ;;
         none) record docker INFO "$ru: логирование отключено" "$en: logging disabled" ;;
@@ -591,7 +774,8 @@ docker_check() {
         "Containers: $containers · running: $running"
     if result=$(docker_local image ls -q --filter dangling=true 2>/dev/null); then
         count=$(awk '/^[a-f0-9]+$/ && !seen[$0]++ {n++} END {print n+0}' <<< "$result")
-        if (( count )); then record docker WARN "Образы без тегов: $count" "Dangling images: $count"
+        if (( count )); then record docker WARN "Образы без тегов: $count" "Dangling images: $count" \
+            "Проверить перед удалением: $(menu_path docker-images)" "Review before removal: $(menu_path docker-images)"
         else record docker OK 'Образы без тегов: 0' 'Dangling images: 0'; fi
     else
         record docker UNKNOWN 'Не удалось посчитать образы без тегов' 'Could not count dangling images'
@@ -610,7 +794,13 @@ docker_check() {
             if ! [[ $reclaim =~ ^[0-9]+([.][0-9]+)?[[:space:]]?[kKMGTPE]?B([[:space:]]\([0-9]+%\))?$ ]]; then
                 reclaim=$(message 'неизвестно' 'unknown')
             fi
-            record docker INFO "$type_ru: объектов $count, активных $active, объём $size, оценка освобождаемого места $reclaim" "$type: records=$count active=$active size=$size reclaimable=$reclaim"
+            local hint_ru='' hint_en=''
+            case $type in
+                Images) hint_ru="Проверить образы: $(menu_path docker-images)"; hint_en="Review images: $(menu_path docker-images)" ;;
+                'Build Cache') hint_ru="Очистить кэш встроенного builder: $(menu_path docker-cache)"; hint_en="Clean built-in builder cache: $(menu_path docker-cache)" ;;
+                *) hint_ru='Автоматическое удаление скриптом не предусмотрено'; hint_en='Automatic removal is not provided' ;;
+            esac
+            record docker INFO "$type_ru: объектов $count, активных $active, объём $size, оценка освобождаемого места $reclaim" "$type: records=$count active=$active size=$size reclaimable=$reclaim" "$hint_ru" "$hint_en"
             ((rows+=1))
         done <<< "$result"
     fi
@@ -673,8 +863,8 @@ kernel_check() {
                     if (( ! autoremove_known )); then
                         decision_ru='оставить: план APT недоступен'; decision_en='keep: APT plan unavailable'
                     elif [[ ${removal_plan[$package]:-} == 1 ]]; then
-                        decision_ru='кандидат на удаление через меню 4 → 11'
-                        decision_en='removal candidate via menu 4 → 11'
+                        decision_ru="кандидат на удаление через меню $(menu_path kernel)"
+                        decision_en="removal candidate via menu $(menu_path kernel)"
                         ((eligible+=1))
                     else
                         decision_ru='оставить: APT не предлагает удаление'; decision_en='keep: not proposed for removal by APT'
@@ -1009,6 +1199,7 @@ maintenance_space_paths() {
             printf '%s\0' /var/log/journal /run/log/journal
             if [[ $action == limit ]]; then printf '%s\0' "${journal_dropin%/*}"; fi ;;
         rsyslog-policy) printf '%s\0' "${rsyslog_rule%/*}" ;;
+        logrotate-edit) printf '%s\0' "${2%/*}" ;;
         restore-config) printf '%s\0' "${restore_target%/*}" ;;
         logrotate) printf '%s\0' /var/log /var/lib/logrotate ;;
         docker-image|docker-cache)
@@ -1248,7 +1439,7 @@ configure_journal_limit() (
 )
 
 rsyslog_policy() {
-    awk '
+    awk -v size="$rsyslog_size_mib" -v count="$rsyslog_archive_count" -v flexible="$rsyslog_custom" '
         /^[[:space:]]*\/var\/log\/syslog[[:space:]]*$/ && !opens { syslog++ }
         /^[[:space:]]*\{[[:space:]]*$/ { opens++; block=1 }
         /^[[:space:]]*\}[[:space:]]*$/ { closes++; block=0 }
@@ -1258,10 +1449,13 @@ rsyslog_policy() {
             match($0, /^[[:space:]]*/)
             indent=substr($0, 1, RLENGTH)
             print indent "daily"
-            print indent "maxsize 100M"
+            print indent "maxsize " size "M"
+            if (flexible) print indent "rotate " count
             next
         }
         block && !script && /^[[:space:]]*maxsize[[:space:]]+100M[[:space:]]*$/ { target++; next }
+        block && !script && flexible && /^[[:space:]]*maxsize[[:space:]]+[0-9]+[kKMG]?[[:space:]]*$/ { target++; next }
+        block && !script && flexible && /^[[:space:]]*rotate[[:space:]]+[0-9]+[[:space:]]*$/ { next }
         block && !script && /^[[:space:]]*(size|minsize|maxsize|hourly|monthly|yearly|minutes)([[:space:]]|$)/ { custom++ }
         { print }
         block && /^[[:space:]]*endscript[[:space:]]*$/ { script=0 }
@@ -1286,7 +1480,7 @@ configure_rsyslog_rotation() (
         return 1
     fi
     if cmp -s -- "$rsyslog_rule" "$temporary"; then
-        printf '%s\n' "$(message 'Ротация daily и maxsize 100M уже настроены.' 'Daily rotation and maxsize 100M are already configured.')"
+        printf '%s\n' "$(message 'Выбранные параметры ротации уже настроены.' 'The selected rotation settings are already configured.')"
         return 0
     fi
     cp -p -- "$rsyslog_rule" "$previous" &&
@@ -1736,11 +1930,28 @@ choose_kernel_removal() {
     return 1
 }
 
+choose_log_number() {
+    local variable=$1 fallback=$2 maximum=$3 prompt=$4 value
+    while :; do
+        printf '%s [%s; q — %s]: ' "$prompt" "$fallback" "$(message отмена cancel)"
+        IFS= read -r value || return 1
+        [[ $value != q && $value != Q ]] || return 1
+        value=${value:-$fallback}
+        if [[ $value =~ ^[1-9][0-9]{0,6}$ ]] && ((value <= maximum)); then
+            printf -v "$variable" '%s' "$value"
+            return 0
+        fi
+        printf '%s\n' "$(message "Введите целое число от 1 до $maximum." "Enter an integer from 1 to $maximum.")"
+    done
+}
+
+log_settings_interactive() { [[ -t 0 ]]; }
+
 compose_logging_override() {
     local service
     printf 'services:\n'
     for service in "$@"; do
-        printf "  '%s':\n    logging:\n      driver: json-file\n      options:\n        max-size: '10m'\n        max-file: '3'\n" "$service"
+        printf "  '%s':\n    logging:\n      driver: json-file\n      options:\n        max-size: '%sm'\n        max-file: '%s'\n" "$service" "$docker_log_mib" "$docker_log_files"
     done
 }
 
@@ -1749,10 +1960,10 @@ compose_logging_model() {
 import json
 import sys
 
-mode, *services = sys.argv[1:]
+size, files, mode, *services = sys.argv[1:]
 before, _, after = sys.stdin.buffer.read().partition(b"\0")
 model = json.loads(before)
-limits = {"max-size": "10m", "max-file": "3"}
+limits = {"max-size": size + "m", "max-file": files}
 pending = []
 for name in services:
     service = model["services"][name]
@@ -1760,17 +1971,20 @@ for name in services:
     if logging is None:
         service["logging"] = {"driver": "json-file", "options": limits}
         pending.append(name)
-    elif logging.get("driver") != "json-file" or any(
+    elif logging.get("driver") != "json-file":
+        sys.exit(1)
+    elif any(
         logging.get("options", {}).get(key) != value for key, value in limits.items()
     ):
-        sys.exit(1)
+        logging.setdefault("options", {}).update(limits)
+        pending.append(name)
 if mode == "pending":
     sys.stdout.buffer.write("\n".join(pending).encode())
 elif mode == "verify":
     sys.exit(model != json.loads(after))
 else:
     sys.exit(bool(pending))
-' "$@"
+' "$docker_log_mib" "$docker_log_files" "$@"
 }
 
 save_compose_logging() (
@@ -1798,20 +2012,24 @@ save_compose_logging() (
         return 0
     fi
     temporary=$(mktemp -- "$directory/.server-auditor.logging.XXXXXXXX") || return 1
-    if ! awk -v pending="$pending" '
+    if ! awk -v pending="$pending" -v size="$docker_log_mib" -v files="$docker_log_files" '
         BEGIN { n=split(pending, names, "\n"); for (i=1; i<=n; i++) wanted[names[i]]=1 }
         /^[^ #]/ { services=($0 ~ /^services:[[:space:]]*(#.*)?$/) }
         {
+            if (skip && ($0 ~ /^    [^ ]/ || $0 ~ /^  [^ ]/ || $0 ~ /^[^ #]/)) skip=0
+            if (skip && ($0 ~ /^      / || $0 ~ /^[[:space:]]*$/)) next
+            if (services && wanted[current] && $0 ~ /^    logging:[[:space:]]*$/) { skip=1; next }
             print
             if (services && $0 ~ /^  [[:alnum:]_.-]+:[[:space:]]*(#.*)?$/) {
                 name=$0; sub(/^  /, "", name); sub(/:.*/, "", name)
+                current=name
                 if (wanted[name]) {
                     found++
                     print "    logging:"
                     print "      driver: json-file"
                     print "      options:"
-                    print "        max-size: \"10m\""
-                    print "        max-file: \"3\""
+                    print "        max-size: \"" size "m\""
+                    print "        max-file: \"" files "\""
                 }
             }
         }
@@ -1870,7 +2088,7 @@ apply_compose_logging() {
                 "$service: exactly one running container is required. Application stopped.")" >&2
             return 1
         fi
-        if [[ $state == 'running|json-file|10m|3' ]]; then
+        if [[ $state == "running|json-file|${docker_log_mib}m|$docker_log_files" ]]; then
             printf '%s\n' "$(message "$service: нужные лимиты уже действуют." "$service: the desired limits are already active.")"
         else
             pending+=("$service")
@@ -1886,17 +2104,18 @@ apply_compose_logging() {
         docker_local_write "${compose[@]}" up -d --no-deps --no-build --pull never "$service" || return 1
         id=$(docker_local "${compose[@]}" ps --all --quiet "$service") || return 1
         if ! [[ $id =~ ^[a-f0-9]{12,64}$ ]] ||
-            ! state=$(compose_logging_state "$id") || [[ $state != 'running|json-file|10m|3' ]]; then
+            ! state=$(compose_logging_state "$id") || [[ $state != "running|json-file|${docker_log_mib}m|$docker_log_files" ]]; then
             printf '%s\n' "$(message "$service: состояние или лимиты не подтверждены. Применение остановлено." \
                 "$service: running state or log limits could not be verified. Application stopped.")" >&2
             return 1
         fi
-        printf '%s\n' "$(message "$service: запущен, подтверждены json-file, 10 МиБ × 3." \
-            "$service: running, verified json-file, 10 MiB × 3.")"
+        printf '%s\n' "$(message "$service: запущен, подтверждены json-file, $docker_log_mib МиБ × $docker_log_files." \
+            "$service: running, verified json-file, $docker_log_mib MiB × $docker_log_files.")"
     done
 }
 
 prepare_compose_logging() {
+    local docker_log_mib=10 docker_log_files=3
     local container metadata service project directory base driver answer available
     local listing id name state number count=0 legacy_override
     local selected_project= selected_directory= selected_base=
@@ -1988,6 +2207,12 @@ prepare_compose_logging() {
             return 1
         fi
     done
+    if log_settings_interactive; then
+        choose_log_number docker_log_mib 10 1048576 "$(message 'Размер одного Docker-лога, МиБ' 'Size of one Docker log, MiB')" || return 0
+        choose_log_number docker_log_files 3 1000 "$(message 'Число файлов Docker (включая текущий)' 'Docker file count (including current)')" || return 0
+    fi
+    printf '%s\n' "$(message "Ориентир на контейнер: $((docker_log_mib * docker_log_files)) МиБ. Общие слои и другие данные сюда не входят." \
+        "Per-container guide: $((docker_log_mib * docker_log_files)) MiB. Other data is excluded.")"
     printf '\n%s\n' "$selected_base"
     compose_logging_override "${services[@]}"
     printf '%s' "$(message 'Проверить и записать лимиты в основной Compose-файл? [д/Н] ' \
@@ -2024,6 +2249,9 @@ load_config_restore() {
     case $restore_kind in
         journald) [[ $restore_target == "$journal_dropin" && ${fields[3]} == journald.conf.before ]] || return 1 ;;
         rsyslog) [[ $restore_target == "$rsyslog_rule" && ${fields[3]} == rsyslog.conf.before && $restore_before_hash != - ]] || return 1 ;;
+        logrotate)
+            [[ ( $restore_target == "$logrotate_config" || ${restore_target%/*} == "$logrotate_rules_directory" ) &&
+                ${fields[3]} == logrotate.conf.before && $restore_before_hash != - ]] || return 1 ;;
         compose)
             case ${restore_target##*/} in compose.yml|compose.yaml|docker-compose.yml|docker-compose.yaml) ;; *) return 1 ;; esac
             [[ $restore_project =~ ^[a-z0-9][a-z0-9_-]*$ && ${fields[3]} == compose.before.yml &&
@@ -2077,7 +2305,7 @@ restore_config_from_history() (
             systemd-analyze --no-pager cat-config systemd/journald.conf >/dev/null || return 1
             config_restart=1
             systemctl restart systemd-journald.service || return 1 ;;
-        rsyslog) logrotate -d "$logrotate_config" >/dev/null || return 1 ;;
+        rsyslog|logrotate) logrotate -d "$logrotate_config" >/dev/null || return 1 ;;
         compose)
             docker_local compose --project-name "$restore_project" --project-directory "${restore_target%/*}" \
                 -f "$restore_target" config --quiet || return 1 ;;
@@ -2287,13 +2515,13 @@ docker_cleanup_menu() {
     has docker || { message 'Docker CLI недоступен.' 'Docker CLI unavailable.'; return 1; }
     while :; do
         printf '\n%s\n' "$(message 'Очистка Docker — локальный сервер' 'Docker cleanup — local engine')" \
-            "$(message '1. Проверить и удалить неиспользуемый образ' '1. Review and remove an unused image')" \
-            "$(message '2. Очистить кэш сборки локального Docker Engine' '2. Clean local Docker Engine build cache')" \
+            "${menu_number[docker-images]}. $(menu_title docker-images)" \
+            "${menu_number[docker-cache]}. $(menu_title docker-cache)" \
             "$(message '0. Назад' '0. Back')"
         IFS= read -r choice || return 0
         case $choice in
             0|'') return 0 ;;
-            1)
+            "${menu_number[docker-images]}")
                 inventory=$(docker_cleanup_inventory) || return 1
                 rows=(); number=0
                 while IFS= read -r row; do
@@ -2322,7 +2550,7 @@ docker_cleanup_menu() {
                     'Remove without a backup? Recovery requires pulling or rebuilding. [y/N]'
                 IFS= read -r answer || return 0
                 case $answer in y|Y|yes|д|Д|да) run_logged_maintenance docker-image remove_docker_image "$row" || return 1 ;; esac ;;
-            2)
+            "${menu_number[docker-cache]}")
                 docker_local system df || return 1
                 message 'Кэш только встроенного builder Docker Engine. Отдельные Buildx builders здесь не очищаются. Оценка Docker может включать общие слои.' \
                     'Only the Docker Engine built-in builder cache. Separate Buildx builders are not cleaned here. Docker estimates may include shared layers.'
@@ -2337,15 +2565,319 @@ docker_cleanup_menu() {
     done
 }
 
+maintenance_log_status() (
+    local action=$1 expected current
+    local format=txt details=1 overview_group=0 checks=0 warnings=0 critical=0 unknown=0
+    printf '\n=== %s ===\n' "$(message 'Текущее состояние перед действием' 'Current state before action')"
+    case $action in
+        rotate|vacuum|limit|journal-status)
+            journal_check
+            if has journalctl; then journalctl --disk-usage || true; fi
+            printf '%s\n' "$(message 'Показаны настройки на диске. Они могут отличаться от загруженных службой.' \
+                'These are settings on disk. Loaded service settings may differ.')"
+            case $action in
+                rotate) printf '%s\n' "$(message 'Ротация переводит активные файлы в архив. Постоянные лимиты не меняются.' \
+                    'Rotation archives active files. Persistent limits are unchanged.')" ;;
+                vacuum) printf '%s\n' "$(message 'Очистка удаляет старые архивные записи до целевого объёма. Постоянные лимиты не меняются.' \
+                    'Vacuuming removes old archived entries toward the target size. Persistent limits are unchanged.')" ;;
+                limit) printf '%s\n' "$(message 'Настройка предложит выбрать общий объём для каждого хранилища и перезапустит journald.' \
+                    'Configuration lets you choose the total size per storage location and restarts journald.')" ;;
+            esac ;;
+        rsyslog-policy)
+            local rsyslog_custom=1
+            printf '%s\n' "$(message "Файл правила: $rsyslog_rule" "Rule file: $rsyslog_rule")"
+            if [[ -f $rsyslog_rule && ! -L $rsyslog_rule ]] && current=$(cat -- "$rsyslog_rule"); then
+                printf '%s\n' "$current"
+                if expected=$(rsyslog_policy "$rsyslog_rule"); then
+                    if [[ $current == "$expected" ]]; then
+                        printf '%s\n' "$(message 'Уже настроено: daily и maxsize 100M. Ниже можно выбрать другие параметры.' \
+                            'Already configured: daily and maxsize 100M. You can choose different settings below.')"
+                    else
+                        printf '%s\n' "$(message 'Правило существует, но профиль daily + maxsize 100M ещё не настроен.' \
+                            'A rule exists, but the daily + maxsize 100M profile is not configured yet.')"
+                    fi
+                else
+                    printf '%s\n' "$(message 'Нестандартное правило: автоматическая настройка не поддерживается.' \
+                        'Custom rule: automatic configuration is unsupported.')"
+                fi
+            else
+                printf '%s\n' "$(message 'Штатное правило rsyslog отсутствует или недоступно. Этот пункт не настраивает Nginx, UFW и другие приложения.' \
+                    'The standard rsyslog rule is absent or inaccessible. This action does not configure Nginx, UFW or other applications.')"
+            fi
+            printf '%s\n' "$(message 'Можно выбрать порог размера и число архивов. Сжатие и служебные команды сохраняются.' \
+                'You can select the size threshold and archive count. Compression and hooks are preserved.')"
+            logrotate_check
+            logrotate_timer_check ;;
+        logrotate)
+            logrotate_check
+            logrotate_timer_check
+            printf '%s\n' "$(message 'Этот пункт не настраивает ограничения: он показывает план и запускает существующие правила.' \
+                'This action does not configure limits: it previews and runs existing rules.')"
+            printf '%s\n' "$(message "Настройка: $(menu_path rsyslog-policy) для rsyslog; редактор блоков других приложений: $(menu_path logrotate-editor); ручная инструкция: $(menu_path logrotate-guide)." \
+                "Configuration: $(menu_path rsyslog-policy) for rsyslog; other application block editor: $(menu_path logrotate-editor); manual guide: $(menu_path logrotate-guide).")"
+            printf '%s\n' "$(message 'Пример параметров внутри существующего блока: daily, maxsize 100M, rotate 4, compress. Затем проверьте конфигурацию в этом пункте.' \
+                'Example settings inside an existing block: daily, maxsize 100M, rotate 4, compress. Then validate the configuration using this action.')"
+            printf '%s\n' "$(message 'maxsize проверяется только при запуске logrotate. Общий лимит /var/log этим не задаётся.' \
+                'maxsize is checked only when logrotate runs. This does not set a shared /var/log cap.')" ;;
+    esac
+)
+
+logrotate_rule_model() {
+    python3 - "$@" <<'PY'
+import json, pathlib, re, shlex, sys
+mode, source, *args = sys.argv[1:]
+raw = pathlib.Path(source).read_bytes()
+text = raw.decode('utf-8', 'surrogateescape')
+lines = text.splitlines(keepends=True)
+blocks, pending, opening, directives, script = [], [], None, [], False
+scripts = {'prerotate', 'postrotate', 'firstaction', 'lastaction', 'preremove'}
+try:
+    for n, line in enumerate(lines):
+        s = line.strip()
+        if opening is not None:
+            if script:
+                if s == 'endscript': script = False
+                continue
+            if s in scripts:
+                script = True
+                continue
+            if s == '}':
+                blocks.append((opening, n, header, directives))
+                opening, directives = None, []
+                continue
+            if not s or s.startswith('#'): continue
+            if '{' in s or '}' in s: raise ValueError('nested or inline braces')
+            tokens = shlex.split(s, comments=True)
+            if tokens and tokens[0] in scripts:
+                if len(tokens) != 1: raise ValueError('ambiguous script directive')
+                script = True
+                continue
+            if tokens and tokens[0] == 'include': raise ValueError('include inside block')
+            directives.append((n, tokens))
+            continue
+        if not s or s.startswith('#'): continue
+        if s.endswith('{'):
+            head = s[:-1].strip()
+            if head: pending.append(head)
+            header = ' '.join(pending)
+            paths = shlex.split(header, comments=True)
+            if not paths or not all(p.startswith('/') for p in paths):
+                raise ValueError('only absolute log paths are supported')
+            opening, pending = n, []
+        elif s.startswith('/') or s.startswith('"'):
+            pending.append(s)
+        elif pending:
+            raise ValueError('ambiguous multiline header')
+    if opening is not None or script or pending: raise ValueError('unfinished block')
+    if mode == 'list':
+        for i, (_, _, header, _) in enumerate(blocks, 1):
+            print(str(i) + '\t' + json.dumps(header, ensure_ascii=True))
+    else:
+        selected = int(args[0])
+        start, end, header, directives = blocks[selected - 1]
+        if selected < 1: raise ValueError('invalid block')
+        if mode == 'show':
+            sys.stdout.buffer.write((header + ' {\n' + ''.join(lines[start + 1:end + 1])).encode('utf-8', 'surrogateescape'))
+        elif mode == 'edit':
+            size, count, period, compression = args[1:]
+            if not re.fullmatch(r'[1-9][0-9]{0,6}', size) or int(size) > 1048576:
+                raise ValueError('invalid size')
+            if not re.fullmatch(r'[1-9][0-9]{0,3}', count) or int(count) > 1000:
+                raise ValueError('invalid count')
+            if period not in {'daily', 'weekly', 'monthly'} or compression not in {'keep', 'compress', 'nocompress'}:
+                raise ValueError('invalid settings')
+            managed = {'hourly', 'daily', 'weekly', 'monthly', 'yearly', 'minutes', 'size', 'minsize', 'maxsize', 'rotate'}
+            if compression != 'keep': managed |= {'compress', 'nocompress'}
+            remove = {n for n, tokens in directives if tokens and tokens[0] in managed}
+            newline = '\r\n' if lines[start].endswith('\r\n') else '\n'
+            settings = [period, 'maxsize ' + size + 'M', 'rotate ' + count]
+            if compression != 'keep': settings.append(compression)
+            output = lines[:start + 1] + ['    ' + s + newline for s in settings]
+            output += [line for n, line in enumerate(lines[start + 1:end], start + 1) if n not in remove]
+            output += lines[end:]
+            sys.stdout.buffer.write(''.join(output).encode('utf-8', 'surrogateescape'))
+        else: raise ValueError('unknown mode')
+except (ValueError, IndexError) as error:
+    print('Unsupported rule: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+save_logrotate_rule() (
+    local target=$1 block=$2 expected_hash=$3 size=$4 count=$5 period=$6 compression=$7 approved_hash=$8
+    local config_target=$target config_backup=$operation_dir/logrotate.conf.before temporary=
+    local config_original config_expected= config_pending=0 config_committed=0 config_restart=0
+    trap 'finish_config_change "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [[ -f $target && ! -L $target && $(stat -c %h -- "$target") == 1 ]] &&
+        trusted_directory "${target%/*}" && [[ $(file_sha256 "$target") == "$expected_hash" ]] || return 1
+    logrotate -d "$logrotate_config" >/dev/null 2>&1 || return 1
+    config_original=$(stat -c '%d:%i:%s:%y' -- "$target") || return 1
+    cp -p -- "$target" "$config_backup" && [[ $(file_sha256 "$config_backup") == "$expected_hash" ]] || return 1
+    temporary=$(mktemp -- "$target.XXXXXXXX.disabled") || return 1
+    logrotate_rule_model edit "$config_backup" "$block" "$size" "$count" "$period" "$compression" > "$temporary" &&
+        [[ $(file_sha256 "$temporary") == "$approved_hash" ]] || return 1
+    diff -u -- "$config_backup" "$temporary" || [[ $? == 1 ]] || return 1
+    chmod --reference="$target" -- "$temporary" && chown --reference="$target" -- "$temporary" &&
+        printf 'config=%q\nblock=%s\nbackup=%q\nmaxsize_MiB=%s\nrotate=%s\nperiod=%s\ncompression=%s\n' \
+            "$target" "$block" "$config_backup" "$size" "$count" "$period" "$compression" >> "$logfile" &&
+        sync -- "$temporary" "$config_backup" "$logfile" "$operation_dir" &&
+        [[ $(file_sha256 "$target") == "$expected_hash" && $(stat -c '%d:%i:%s:%y' -- "$target") == "$config_original" ]] || return 1
+    config_expected=$(stat -c '%d:%i:%s:%y' -- "$temporary") || return 1
+    config_pending=1
+    mv -fT -- "$temporary" "$target" || return 1
+    logrotate -d "$logrotate_config" >/dev/null && sync -- "$target" "${target%/*}" &&
+        write_config_restore_metadata logrotate "$target" "$config_backup" || return 1
+    config_committed=1
+    printf '%s\n' "$(message 'Правило сохранено и проверено. Ротация ещё не запускалась.' 'Rule saved and validated. Rotation has not run yet.')"
+)
+
+edit_logrotate_rules() (
+    local path listing block label choice index=0 size=100 count=4 period=daily compression=keep answer digest preview approved native
+    local -a files=() blocks=() hashes=() sources=()
+    local preview_dir=
+    trap 'if [[ -n $preview_dir ]]; then rm -f -- "$preview_dir/after"; rmdir -- "$preview_dir"; fi' EXIT
+    has python3 && has logrotate || return 1
+    native=$(logrotate -d "$logrotate_config" 2>&1) || { printf '%s\n' "$native"; return 1; }
+    sources+=("$logrotate_config")
+    if [[ $native == *"including $logrotate_rules_directory"$'\n'* || $native == *"including $logrotate_rules_directory" ]]; then
+        while IFS= read -r -d '' path; do sources+=("$path"); done < <(find "$logrotate_rules_directory" -maxdepth 1 -type f ! -name '.*' -print0 2>/dev/null | sort -z)
+    fi
+    printf '\n%s\n' "$(message 'Выберите блок журнала. Нестандартные файлы пропускаются с объяснением.' 'Select a log block. Unsupported files are skipped with an explanation.')"
+    for path in "${sources[@]}"; do
+        [[ -f $path && ! -L $path && $(stat -c %h -- "$path") == 1 ]] && trusted_directory "${path%/*}" || continue
+        # Only offer files actually read by the native validation.
+        [[ $native == *"reading config file $path"$'\n'* || $native == *"reading config file ${path##*/}"$'\n'* ||
+            $native == *"reading config file $path" || $native == *"reading config file ${path##*/}" ]] || continue
+        digest=$(file_sha256 "$path") || return 1
+        printf -v label '%q' "$path"
+        if ! listing=$(logrotate_rule_model list "$path" 2>&1); then printf '%s: %s\n' "$label" "$listing"; continue; fi
+        [[ $(file_sha256 "$path") == "$digest" ]] || return 1
+        while IFS=$'\t' read -r block preview; do
+            [[ -n $block ]] || continue
+            ((index+=1)); files+=("$path"); blocks+=("$block"); hashes+=("$digest")
+            printf '  %d. %s — %s (%s %s)\n' "$index" "$preview" "$label" "$(message блок block)" "$block"
+        done <<< "$listing"
+    done
+    ((index)) || { printf '%s\n' "$(message "Поддерживаемых блоков нет. Инструкция: $(menu_path logrotate-guide)." "No supported blocks. Guide: $(menu_path logrotate-guide).")"; return 0; }
+    printf '%s' "$(message 'Номер (0 или Enter — назад): ' 'Number (0 or Enter to go back): ')"
+    IFS= read -r choice || return 0
+    [[ -z $choice || $choice == 0 ]] && return 0
+    [[ $choice =~ ^[1-9][0-9]{0,5}$ ]] && ((choice <= index)) || return 1
+    path=${files[choice-1]}; block=${blocks[choice-1]}; digest=${hashes[choice-1]}
+    [[ $(file_sha256 "$path") == "$digest" ]] || return 1
+    printf '%s\n' "$(message 'Точный локальный блок (неуказанные параметры могут наследоваться):' 'Exact local block (unspecified options may be inherited):')"
+    logrotate_rule_model show "$path" "$block" || return 1
+    printf '%s\n' "$(message 'Действующие условия по всей конфигурации:' 'Effective conditions from the complete configuration:')"
+    local details=1
+    logrotate_check
+    choose_log_number size 100 1048576 "$(message 'Порог размера, МиБ' 'Size threshold, MiB')" || return 0
+    choose_log_number count 4 1000 "$(message 'Архивов на файл (текущий дополнительно)' 'Archives per file (current is additional)')" || return 0
+    printf '%s' "$(message 'Период: 1 ежедневно, 2 еженедельно, 3 ежемесячно [1; q отмена]: ' 'Interval: 1 daily, 2 weekly, 3 monthly [1; q cancel]: ')"
+    IFS= read -r answer || return 0
+    case $answer in ''|1) period=daily ;; 2) period=weekly ;; 3) period=monthly ;; q|Q) return 0 ;; *) return 1 ;; esac
+    printf '%s' "$(message 'Сжатие: 1 включить, 2 отключить, 3 сохранить [3; q отмена]: ' 'Compression: 1 enable, 2 disable, 3 preserve [3; q cancel]: ')"
+    IFS= read -r answer || return 0
+    case $answer in 1) compression=compress ;; 2) compression=nocompress ;; ''|3) compression=keep ;; q|Q) return 0 ;; *) return 1 ;; esac
+    preview_dir=$(mktemp -d) || return 1
+    logrotate_rule_model edit "$path" "$block" "$size" "$count" "$period" "$compression" > "$preview_dir/after" || return 1
+    [[ $(file_sha256 "$path") == "$digest" ]] || return 1
+    approved=$(file_sha256 "$preview_dir/after") || return 1
+    if cmp -s -- "$path" "$preview_dir/after"; then printf '%s\n' "$(message 'Изменений нет.' 'No changes.')"; return 0; fi
+    diff -u -- "$path" "$preview_dir/after" || [[ $? == 1 ]] || return 1
+    printf '%s\n' "$(message 'maxsize проверяется при запуске logrotate. Сохраняются команды приложения и прочие условия, включая maxage/minage. Старые архивы могут удаляться при ротации.' \
+        'maxsize is checked when logrotate runs. Application hooks and other conditions, including maxage/minage, are preserved. Rotation may remove old archives.')"
+    printf '%s' "$(message 'Записать показанные изменения с резервной копией? [д/Н] ' 'Write these changes with a backup? [y/N] ')"
+    IFS= read -r answer || return 0
+    case $answer in y|Y|yes|д|Д|да) ;; *) return 0 ;; esac
+    run_logged_maintenance logrotate-edit save_logrotate_rule "$path" "$block" "$digest" "$size" "$count" "$period" "$compression" "$approved" || return 1
+    printf '%s' "$(message 'Показать план и предложить обычную ротацию сейчас? [д/Н] ' 'Preview and offer normal rotation now? [y/N] ')"
+    IFS= read -r answer || return 0
+    case $answer in y|Y|yes|д|Д|да) maintenance_action logrotate ;; esac
+)
+
+logrotate_editing_guide() {
+    local path label choice size_mib=100 archive_count=4 period=daily answer index=0
+    local -a files=()
+    printf '\n%s\n' "$(message 'Настройка правил logrotate — инструкция без изменения файлов' \
+        'Configure logrotate rules — instructions without file changes')"
+    if [[ -f $logrotate_config && ! -L $logrotate_config ]]; then files+=("$logrotate_config"); fi
+    while IFS= read -r -d '' path; do
+        [[ -f $path && ! -L $path ]] || continue
+        files+=("$path")
+    done < <(find "$logrotate_rules_directory" -maxdepth 1 -type f ! -name '.*' -print0 2>/dev/null | sort -z)
+    ((${#files[@]})) || { printf '%s\n' "$(message 'Файлы правил не найдены.' 'No rule files found.')"; return 1; }
+    for path in "${files[@]}"; do
+        ((index+=1))
+        printf -v label '%q' "$path"
+        printf '  %d. %s\n' "$index" "$label"
+        # Show declared log paths as navigation hints; the complete file follows selection.
+        awk '
+            /^[[:space:]]*(postrotate|prerotate|firstaction|lastaction|preremove)[[:space:]]*$/ { script=1; next }
+            /^[[:space:]]*endscript[[:space:]]*$/ { script=0; next }
+            !script && !/^[[:space:]]*#/ && /^[[:space:]]*[\/"]/ { print "       " $0 }
+        ' "$path"
+    done
+    printf '%s' "$(message 'Номер файла (0 или Enter — назад): ' 'File number (0 or Enter to go back): ')"
+    IFS= read -r choice || return 0
+    [[ -z $choice || $choice == 0 ]] && return 0
+    [[ $choice =~ ^[1-9][0-9]{0,5}$ ]] && ((choice <= ${#files[@]})) || return 1
+    path=${files[choice-1]}
+    [[ -f $path && ! -L $path ]] || return 1
+    printf -v label '%q' "$path"
+    printf '\n%s\n' "$(message "Текущее содержимое $label:" "Current contents of $label:")"
+    nl -ba -- "$path" || return 1
+    choose_log_number size_mib 100 1048576 "$(message 'Желаемый порог одного файла, МиБ' 'Desired threshold per file, MiB')" || return 0
+    choose_log_number archive_count 4 1000 "$(message 'Число архивов на файл (текущий дополнительно)' 'Archives per file (current file is additional)')" || return 0
+    printf '%s' "$(message 'Период: 1 — ежедневно, 2 — еженедельно, 3 — ежемесячно [1; q — отмена]: ' \
+        'Interval: 1 — daily, 2 — weekly, 3 — monthly [1; q — cancel]: ')"
+    IFS= read -r answer || return 0
+    case $answer in ''|1) period=daily ;; 2) period=weekly ;; 3) period=monthly ;; q|Q) return 0 ;; *) return 1 ;; esac
+    printf '\n%s\n' "$(message '1. Сохраните резервную копию выбранного файла вне /etc/logrotate.d/.' \
+        '1. Back up the selected file outside /etc/logrotate.d/.')"
+    printf '%s\n' "$(message '2. Откройте существующий файл в редакторе:' '2. Open the existing file in an editor:')"
+    printf '   sudoedit -- %s\n' "$label"
+    printf '%s\n' "$(message '3. В нужном блоке { ... } замените параметры периода, maxsize и rotate следующими:' \
+        '3. In the intended { ... } block, replace the interval, maxsize and rotate settings with:')"
+    printf '       %s\n       maxsize %sM\n       rotate %s\n' "$period" "$size_mib" "$archive_count"
+    printf '%s\n' "$(message 'Не добавляйте второй блок для тех же путей. Не меняйте include, postrotate, prerotate, create, su и другие служебные настройки.' \
+        'Do not add a second block for the same paths. Preserve include, postrotate, prerotate, create, su and other service settings.')"
+    printf '%s\n' "$(message 'Если в блоке есть size, minsize, maxage, rotate -1 или другие условия, сначала проверьте их смысл: не добавляйте противоречащие параметры. Файл может содержать несколько блоков.' \
+        'If the block has size, minsize, maxage, rotate -1 or other conditions, review them first and avoid conflicting settings. A file may contain multiple blocks.')"
+    printf '%s\n' "$(message 'compress включает сжатие архивов. Сохраните delaycompress, если приложение использует его; сжатие здесь автоматически не меняется.' \
+        'compress enables archive compression. Preserve delaycompress when used by the application; compression is not changed automatically here.')"
+    printf '%s\n' "$(message '4. Проверьте всю конфигурацию без изменения журналов:' '4. Validate the complete configuration without changing logs:')"
+    printf -v label '%q' "$logrotate_config"
+    printf '   sudo logrotate -d %s\n' "$label"
+    printf '%s\n' "$(message "5. Если проверка успешна, откройте $(menu_path logrotate) для плана и подтверждения обычной ротации. Принудительная ротация не требуется." \
+        "5. After successful validation, use $(menu_path logrotate) to preview and confirm normal rotation. Forced rotation is unnecessary.")"
+    printf '%s\n' "$(message 'Порог проверяется только при запуске logrotate. Учитывайте частоту таймера. Общий объём /var/log не ограничивается.' \
+        'The threshold is checked only when logrotate runs. Account for timer frequency. This does not cap total /var/log usage.')"
+    printf '%s\n' "$(message 'Файлы не изменены. Ручные правки и их резервные копии не добавляются в историю аудитора автоматически.' \
+        'No files were changed. Manual edits and backups are not automatically recorded in auditor history.')"
+}
+
 maintenance_action() {
     local action=$1 package prompt answer source destination fingerprint preview
+    local journal_limit=$journal_limit rsyslog_size_mib=$rsyslog_size_mib rsyslog_archive_count=$rsyslog_archive_count rsyslog_custom=$rsyslog_custom
     local -a command=()
     case $action in
+        rotate|vacuum|limit|rsyslog-policy|logrotate) maintenance_log_status "$action" ;;
+    esac
+    case $action in
+        journal-status) maintenance_log_status journal-status; return ;;
+        rotation-status)
+            (local format=txt details=1 overview_group=0; logrotate_check; logrotate_timer_check); return ;;
+        docker-log-status)
+            (local format=txt details=1 overview_group=0; docker_check); return ;;
         archive-options)
             [[ -n ${2:-} ]] || return 2
             choose_archive_action "$2"; return ;;
         compose-logging) prepare_compose_logging; return ;;
         docker-cleanup) docker_cleanup_menu; return ;;
+        logrotate-guide) logrotate_editing_guide; return ;;
+        logrotate-editor) edit_logrotate_rules; return ;;
         kernel) choose_kernel_removal; return ;;
         orphan-kernel) choose_orphan_kernel_group; return ;;
         restore-config) choose_config_restore; return ;;
@@ -2361,14 +2893,24 @@ maintenance_action() {
             command=(journalctl --rotate)
             prompt=$(message 'Ротировать активные файлы journald?' 'Rotate active journal files?') ;;
         vacuum)
+            if log_settings_interactive; then
+                local selected_mib=100
+                choose_log_number selected_mib 100 1048576 "$(message 'Целевой объём journald после очистки, МиБ' 'Target journald size after cleanup, MiB')" || return 0
+                journal_limit=$((selected_mib * 1024 * 1024))
+            fi
             command=(journalctl --rotate "--vacuum-size=$journal_limit")
-            prompt=$(message 'Ротировать журнал и удалить старые архивы до целевого размера 100 МиБ? Удалённые записи восстановить нельзя.' \
-                'Rotate the journal and delete old archives toward the 100 MiB target? Deleted entries cannot be recovered.') ;;
+            prompt=$(message "Ротировать журнал и удалить старые архивы до целевого размера $(human_bytes "$journal_limit")? Удалённые записи восстановить нельзя." \
+                "Rotate and delete old archives toward $(human_bytes "$journal_limit")? Deleted entries cannot be recovered.") ;;
         limit)
             if ! has systemctl || ! has systemd-analyze; then return 1; fi
+            if log_settings_interactive; then
+                local selected_mib=100
+                choose_log_number selected_mib 100 1048576 "$(message 'Общий лимит journald, МиБ (для каждого хранилища)' 'Total journald limit, MiB (per storage location)')" || return 0
+                journal_limit=$((selected_mib * 1024 * 1024))
+            fi
             command=(configure_journal_limit)
-            prompt=$(message 'Установить постоянный лимит journald 100 МиБ и перезапустить службу? Старые записи могут быть удалены при ротации.' \
-                'Set a persistent 100 MiB journald limit and restart the service? Older entries may be deleted during rotation.') ;;
+            prompt=$(message "Установить постоянный лимит journald $(human_bytes "$journal_limit") и перезапустить службу? Старые записи могут быть удалены при ротации." \
+                "Set persistent journald limit $(human_bytes "$journal_limit") and restart? Older entries may be deleted during rotation.") ;;
         archive)
             source=${2:-}
             if [[ -z $source ]]; then
@@ -2414,9 +2956,19 @@ maintenance_action() {
             show_maintenance_history; return ;;
         rsyslog-policy)
             has logrotate || return 1
+            if log_settings_interactive; then
+                choose_log_number rsyslog_size_mib 100 1048576 "$(message 'Порог размера одного лога rsyslog, МиБ' 'Size threshold per rsyslog file, MiB')" || return 0
+                choose_log_number rsyslog_archive_count 4 1000 "$(message 'Число архивов на лог (текущий файл дополнительно)' 'Archives per log (current file is additional)')" || return 0
+                rsyslog_custom=1
+                printf '%s\n' "$(message "Ориентир на один путь: $((rsyslog_size_mib * (rsyslog_archive_count + 1))) МиБ без учёта сжатия и роста между запусками. Это не жёсткий лимит." \
+                    "Per-path guide: $((rsyslog_size_mib * (rsyslog_archive_count + 1))) MiB before compression and growth between runs. Not a hard cap.")"
+            fi
+            [[ -f $rsyslog_rule && ! -L $rsyslog_rule ]] &&
+                rsyslog_policy "$rsyslog_rule" >/dev/null || return 1
+            if [[ $(cat -- "$rsyslog_rule") == "$(rsyslog_policy "$rsyslog_rule")" ]]; then return 0; fi
             command=(configure_rsyslog_rotation)
-            prompt=$(message 'Настроить ежедневную ротацию rsyslog с порогом 100 МиБ и сохранить копию правила?' \
-                'Set daily rsyslog rotation with a 100 MiB threshold and back up the rule?') ;;
+            prompt=$(message "Настроить ежедневную ротацию rsyslog: $rsyslog_size_mib МиБ, архивов $rsyslog_archive_count, и сохранить копию правила?" \
+                "Configure daily rsyslog rotation: $rsyslog_size_mib MiB, $rsyslog_archive_count archives, and back up the rule?") ;;
         logrotate)
             has logrotate || return 1
             local available
@@ -2649,51 +3201,37 @@ cleanup_plan() {
     fi
 }
 
-maintenance_menu() {
-    local choice action
+registered_menu() {
+    local parent=$1 choice id selected action
     while :; do
-        printf '\n%s\n' "$(message 'Обслуживание системы' 'System maintenance')" \
-            "$(message '1. Очистить кэш APT' '1. Clear APT cache')" \
-            "$(message '2. Удалить ненужные зависимости APT' '2. Remove unused APT dependencies')" \
-            "$(message '3. Ротировать журналы systemd' '3. Rotate systemd journals')" \
-            "$(message '4. Ротировать и очистить архивы journald до 100 МиБ' '4. Rotate and vacuum journald archives to 100 MiB')" \
-            "$(message '5. Настроить постоянный лимит journald' '5. Configure a persistent journald limit')" \
-            "$(message '6. Перенести архив логов на другой диск' '6. Move a log archive to another filesystem')" \
-            "$(message '7. История обслуживания' '7. Maintenance history')" \
-            "$(message '8. Настроить ротацию обычного syslog' '8. Configure regular syslog rotation')" \
-            "$(message '9. Показать план и запустить logrotate' '9. Preview and run logrotate')" \
-            "$(message '10. План освобождения места' '10. Disk space recovery plan')" \
-            "$(message '11. Удалить один старый пакет ядра' '11. Remove one old kernel package')" \
-            "$(message '12. Подготовить ротацию Docker-логов для Compose' '12. Prepare Docker log rotation for Compose')" \
-            "$(message '13. Очистить связанные пакеты удалённого ядра' '13. Clean leftover packages of a removed kernel')" \
-            "$(message '14. Восстановить конфигурацию из истории' '14. Restore a configuration from history')" \
-            "$(message '15. Очистка Docker' '15. Docker cleanup')" \
-            "$(message '0. Назад' '0. Back')"
+        printf '\n=== %s ===\n' "$(menu_title "$parent")"
+        for id in ${menu_items[$parent]:-}; do
+            printf '%s. %s\n' "${menu_number[$id]}" "$(menu_title "$id")"
+        done
+        printf '0. %s\n' "$(message Назад Back)"
         printf '%s' "$(message 'Ваш выбор: ' 'Your choice: ')"
         IFS= read -r choice || return 0
-        case $choice in
-            1) action=clean ;;
-            2) action=autoremove ;;
-            3) action=rotate ;;
-            4) action=vacuum ;;
-            5) action=limit ;;
-            6) action=archive ;;
-            7) action=history ;;
-            8) action=rsyslog-policy ;;
-            9) action=logrotate ;;
-            10) cleanup_plan || printf '%s\n' "$(message 'Действие не завершено.' 'The action did not complete.')"; continue ;;
-            11) action=kernel ;;
-            12) action=compose-logging ;;
-            13) action=orphan-kernel ;;
-            14) action=restore-config ;;
-            15) action=docker-cleanup ;;
-            0) return 0 ;;
-            *) printf '%s\n' "$(message 'Выберите действие из списка.' 'Choose an action from the list.')"; continue ;;
-        esac
-        run_maintenance_action "$action" && continue
-        printf '%s\n' "$(message 'Действие не завершено.' 'The action did not complete.')"
+        [[ $choice != 0 && -n $choice ]] || return 0
+        selected=''
+        for id in ${menu_items[$parent]:-}; do
+            if [[ $choice == "${menu_number[$id]}" ]]; then selected=$id; break; fi
+        done
+        if [[ -z $selected ]]; then
+            printf '%s\n' "$(message 'Выберите действие из списка.' 'Choose an action from the list.')"
+            continue
+        fi
+        action=${menu_action[$selected]}
+        if [[ $action == @* ]]; then registered_menu "${action#@}"; continue; fi
+        if [[ -z $action ]]; then registered_menu "$selected"; continue; fi
+        if [[ $action == cleanup-plan ]]; then
+            cleanup_plan || printf '%s\n' "$(message 'Действие не завершено.' 'The action did not complete.')"
+            continue
+        fi
+        run_maintenance_action "$action" || printf '%s\n' "$(message 'Действие не завершено.' 'The action did not complete.')"
     done
 }
+
+maintenance_menu() { registered_menu maintenance; }
 
 interactive_overview() {
     local format=txt details=1 overview_group=1 choice section status show=1
@@ -2740,18 +3278,18 @@ menu() {
     local choice
     while :; do
         printf '\n%s\n' "Server Auditor v$VERSION" \
-            "$(message '1. Сводка с подробностями по разделам' '1. Overview with section details')" \
-            "$(message '2. Обновить пакеты' '2. Update packages')" \
-            "$(message '3. Подробный аудит системы' '3. Detailed system audit')" \
-            "$(message '4. Обслуживание системы' '4. System maintenance')" \
+            "${menu_number[overview]}. $(menu_title overview)" \
+            "${menu_number[update]}. $(menu_title update)" \
+            "${menu_number[full-audit]}. $(menu_title full-audit)" \
+            "${menu_number[maintenance]}. $(menu_title maintenance)" \
             "$(message '0. Выход' '0. Exit')"
         printf '%s' "$(message 'Ваш выбор: ' 'Your choice: ')"
         IFS= read -r choice || return 0
         case $choice in
-            1) interactive_overview ;;
-            3) details=1 audit ;;
-            4) maintenance_menu ;;
-            2)
+            "${menu_number[overview]}") interactive_overview ;;
+            "${menu_number[full-audit]}") details=1 audit ;;
+            "${menu_number[maintenance]}") maintenance_menu ;;
+            "${menu_number[update]}")
                 if (( EUID == 0 )); then
                     update 0 || printf '%s\n' "$(message 'Обновление завершилось ошибкой.' 'Update failed.')" >&2
                 elif has sudo; then

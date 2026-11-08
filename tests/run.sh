@@ -12,6 +12,140 @@ omits() { [[ $1 != *"$2"* ]] || fail "unexpected: $2"; }
 
 omits "$(safety_line keep example)" $'\033['
 (
+    [[ $(menu_path clean) == '4 → 2 → 1' ]]
+    [[ $(menu_path logrotate-editor) == '4 → 3 → 2 → 2' ]]
+    [[ $(menu_path compose-logging) == '4 → 3 → 3 → 2' ]]
+    # Every catalog entry has a unique sibling number and a resolvable path.
+    for parent in "${!menu_items[@]}"; do
+        seen=' '
+        for id in ${menu_items[$parent]}; do
+            [[ $seen != *" ${menu_number[$id]} "* ]] || fail 'duplicate menu number'
+            seen+="${menu_number[$id]} "
+            menu_path "$id" >/dev/null || fail 'broken menu path'
+            [[ -n $(menu_title "$id") ]] || fail 'empty menu title'
+            if [[ ${menu_action[$id]} == @* ]]; then
+                [[ -n ${menu_items[${menu_action[$id]#@}]:-} ]] || fail 'broken shortcut'
+            fi
+        done
+    done
+    if menu_path no-such-action >/dev/null; then fail 'accepted unknown action ID'; fi
+    run_maintenance_action() { printf 'selected-action: %s\n' "$1"; }
+    cleanup_plan() { printf 'selected-plan\n'; }
+    output=$(maintenance_menu <<< $'3\n1\n2\n0\n2\n2\n0\n3\n2\n0\n4\n1\n0\n5\n2\n0\n0\n4\n3\n2\n0\n0\n2\n3\n0\n1\n5\n1\n0\n0')
+    contains "$output" 'selected-action: limit'
+    contains "$output" 'selected-action: logrotate-editor'
+    contains "$output" 'selected-action: compose-logging'
+    contains "$output" 'selected-action: restore-config'
+    contains "$output" 'selected-action: kernel'
+    contains "$output" 'selected-action: history'
+    contains "$output" 'selected-plan'
+    output=$(language=ru maintenance_menu <<< $'3\n1\n0\n0\n0')
+    contains "$output" 'Журналы и ротация'
+    contains "$output" 'Настроить постоянный лимит'
+    (
+        maintenance_menu() { printf 'entered-maintenance\n'; }
+        menu_number[maintenance]=6
+        [[ $(menu_path limit) == '6 → 3 → 1 → 2' ]]
+        output=$(menu <<< $'6\n0')
+        contains "$output" '6. System maintenance'
+        contains "$output" 'entered-maintenance'
+    )
+)
+(
+    test_dir=$(mktemp -d)
+    trap 'rm -f -- "$test_dir/rules/nginx" "$test_dir/main.conf"; rmdir -- "$test_dir/rules" "$test_dir"' EXIT
+    mkdir -- "$test_dir/rules"
+    logrotate_config=$test_dir/main.conf
+    logrotate_rules_directory=$test_dir/rules
+    printf 'include %s\n' "$logrotate_rules_directory" > "$logrotate_config"
+    printf '/var/log/nginx/*.log {\n daily\n rotate 14\n postrotate\n /usr/sbin/example-reopen\n endscript\n}\n' > "$logrotate_rules_directory/nginx"
+    original=$(cat "$logrotate_rules_directory/nginx")
+    output=$(logrotate_editing_guide <<< $'2\n5\n2\n1')
+    contains "$output" 'Current contents of'
+    contains "$output" '/var/log/nginx/*.log'
+    contains "$output" 'maxsize 5M'
+    contains "$output" 'rotate 2'
+    contains "$output" 'sudoedit --'
+    contains "$output" 'No files were changed'
+    contains "$output" 'not automatically recorded'
+    [[ $(cat "$logrotate_rules_directory/nginx") == "$original" ]]
+    output=$(logrotate_editing_guide <<< 0)
+    omits "$output" 'sudoedit --'
+)
+(
+    selected=0
+    choose_log_number selected 25 100 'Size' <<< $'bad\n0\n101\n12' >/dev/null
+    [[ $selected == 12 ]]
+    choose_log_number selected 25 100 'Size' <<< '' >/dev/null
+    [[ $selected == 25 ]]
+    if choose_log_number selected 25 100 'Size' <<< q >/dev/null; then fail 'ignored settings cancellation'; fi
+    log_settings_interactive() { return 0; }
+    maintenance_log_status() { :; }
+    journalctl() { printf 'journal action: %s\n' "$*"; }
+    run_logged_maintenance() { shift; "$@"; }
+    output=$(maintenance_action vacuum <<< $'25\nyes')
+    contains "$output" '--vacuum-size=26214400'
+    test_dir=$(mktemp -d)
+    trap 'rm -f -- "$test_dir/rsyslog"; rmdir -- "$test_dir"' EXIT
+    printf '/var/log/syslog\n{\n daily\n maxsize 100M\n rotate 4\n compress\n}\n' > "$test_dir/rsyslog"
+    rsyslog_size_mib=5 rsyslog_archive_count=2 rsyslog_custom=1
+    output=$(rsyslog_policy "$test_dir/rsyslog")
+    contains "$output" 'maxsize 5M'
+    contains "$output" 'rotate 2'
+    contains "$output" 'compress'
+    omits "$output" '100M'
+    docker_log_mib=2 docker_log_files=2
+    contains "$(compose_logging_override app)" "max-size: '2m'"
+    if has python3; then
+        model='{"services":{"app":{"image":"example","logging":{"driver":"json-file","options":{"max-size":"10m","max-file":"3"}}}}}'
+        contains "$(printf '%s' "$model" | compose_logging_model pending app)" 'app'
+        after='{"services":{"app":{"image":"example","logging":{"driver":"json-file","options":{"max-size":"2m","max-file":"2"}}}}}'
+        printf '%s\0%s' "$model" "$after" | compose_logging_model verify app
+    fi
+)
+(
+    test_dir=$(mktemp -d)
+    trap 'rm -f -- "$test_dir/rsyslog"; rmdir -- "$test_dir"' EXIT
+    rsyslog_rule=$test_dir/rsyslog
+    journal_check() { printf 'current journal configuration\n'; checks=999; }
+    journalctl() { [[ $1 == --disk-usage ]] || fail 'status modified journal'; printf 'current journal usage\n'; }
+    logrotate_check() { printf 'current rotation configuration\n'; }
+    logrotate_timer_check() { printf 'current timer state\n'; }
+    has() { return 0; }
+    before=$checks
+    for action in rotate vacuum limit; do
+        output=$(maintenance_log_status "$action")
+        contains "$output" 'current journal configuration'
+        contains "$output" 'current journal usage'
+    done
+    [[ $checks == "$before" ]]
+    output=$(maintenance_log_status rsyslog-policy)
+    contains "$output" 'absent or inaccessible'
+    printf '/var/log/syslog\n{\n daily\n maxsize 100M\n rotate 4\n}\n' > "$rsyslog_rule"
+    output=$(maintenance_action rsyslog-policy </dev/null)
+    contains "$output" 'Already configured'
+    omits "$output" '[y/N]'
+    printf '/var/log/syslog\n{\n weekly\n rotate 4\n}\n' > "$rsyslog_rule"
+    output=$(maintenance_log_status rsyslog-policy)
+    contains "$output" 'not configured yet'
+    output=$(maintenance_log_status logrotate)
+    contains "$output" 'does not configure limits'
+    contains "$output" 'daily, maxsize 100M, rotate 4, compress'
+)
+(
+    language=ru
+    output=$(record test INFO 'Проверка' 'Check' 'Меню 4 → 1' 'Menu 4 → 1')
+    contains "$output" '[Меню 4 → 1]'
+    language=en
+    output=$(record test INFO 'Проверка' 'Check' 'Меню 4 → 1' 'Menu 4 → 1')
+    contains "$output" '[Menu 4 → 1]'
+    format=json
+    output=$(record test INFO 'Проверка' 'Check' 'Меню 4 → 1' 'Menu 4 → 1')
+    contains "$output" '"message":"Check","hint":"Menu 4 → 1"'
+    output=$(record test SKIP 'Нет' 'Unavailable')
+    omits "$output" '"hint"'
+)
+(
     colors_enabled() { return 0; }
     contains "$(safety_line keep example)" $'\033[31m[KEEP]'
     contains "$(safety_line clean example)" $'\033[32m[CLEANUP]'
@@ -57,6 +191,52 @@ contains "$output" 'apparent_bytes=209715200 path='
 contains "$output" '/var/log/private\nlog'
 omits "$output" 'unrelated'
 unset -f logrotate find
+
+(
+    details=1
+    fixture=$'rotating pattern: /var/log/time.log weekly (4 rotations)\nempty log files are not rotated, old logs are removed\nconsidering log /var/log/time.log\nrotating pattern: /var/log/min.log monthly (1 rotations)\nempty log files are rotated, only log files >= 1048576 bytes are rotated, old logs are removed\nconsidering log /var/log/min.log\nrotating pattern: /var/log/max.log after 1 days (3 rotations)\nempty log files are not rotated, log files >= 104857600 are rotated earlier, old logs are removed\nconsidering log /var/log/max.log\nrotating pattern: /var/log/size.log 10485760 bytes (2 rotations)\nempty log files are not rotated, old logs are removed\nconsidering log /var/log/size.log'
+    output=$(logrotate_capacity_report "$fixture")
+    contains "$output" 'size_threshold_rules=2 finite_retention_rules=2 no_size_threshold_rules=2 unrecognized_rules=0'
+    contains "$output" 'Rule 2: /var/log/min.log'
+    contains "$output" 'Size: No maximum-size rotation threshold detected'
+    contains "$output" 'Size: Rotation threshold 100.00 MiB'
+    contains "$output" "Configuration: Standard-block editor: $(menu_path logrotate-editor)"
+    omits "$output" 'Rule 2 capacity:'
+    [[ $(printf '%s\n' "$output" | awk '/^\[INFO/ {n++} END {print n}') == 5 ]]
+    contains "$output" 'total regular-log cap is not established'
+    output=$(logrotate_capacity_report $'rotating pattern: /var/log/odd.log unknown\nconsidering log /var/log/odd.log')
+    contains "$output" 'unrecognized_rules=1'
+)
+
+(
+    language=ru; details=1
+    logrotate() {
+        printf '%s\n' \
+            'rotating pattern: /var/log/nginx/*.log ' \
+            ' after 1 days (14 rotations)' \
+            'empty log files are not rotated, old logs are removed' \
+            'considering log /var/log/nginx/access.log' \
+            'rotating pattern: /var/log/ufw.log' \
+            '1048576 bytes (4 rotations)' \
+            'empty log files are rotated, only log files >= 1048576 bytes are rotated, old logs are removed' \
+            'considering log /var/log/ufw.log'
+    }
+    output=$(logrotate_check)
+    contains "$output" 'Правило 1: /var/log/nginx/*.log'
+    contains "$output" 'период: 1 сут. (14 архивов)'
+    contains "$output" 'Условия: пустые логи пропускаются'
+    contains "$output" 'Правило 2: /var/log/ufw.log'
+    contains "$output" 'Условия: пустые логи ротируются'
+    contains "$output" "Настройка: Редактор стандартных блоков: $(menu_path logrotate-editor)"
+    contains "$output" '1,00 МиБ'
+    omits "$output" 'after 1 days'
+    omits "$output" '1048576'
+    output=$(journal_config $'[Journal]\nSystemMaxUse=100M\nRuntimeMaxUse=100M')
+    contains "$output" 'SystemMaxUse=100,00 МиБ'
+    df() { printf 'Use%% Avail IUse%% Size Used Mounted\n57%% 4424802304 16%% 10485571584 6060769280 /\n'; }
+    output=$(disk_check)
+    contains "$output" 'доступно 4,12 ГиБ из 9,77 ГиБ'
+)
 
 (
     tail() {
@@ -447,7 +627,7 @@ contains "$output" '/ — total 10 GiB'
 omits "$output" 'Disk critical'
 output=$(menu <<< $'bad\n1\n4\ns\n0\n2\n3\n4\n0\n0')
 contains "$output" 'Choose an action from the list.'
-contains "$output" '4. Rotate and vacuum journald archives to 100 MiB'
+contains "$output" '3. Logs and rotation'
 contains "$output" 'test update 0'
 contains "$output" '=== Disks and filesystems ==='
 contains "$output" '[CRIT   ] Disk critical'
@@ -533,7 +713,7 @@ contains "$output" '[CRIT   ] Disk critical'
     output=$(kernel_check)
     contains "$output" '6.1.0-49-amd64 (running) — keep: running'
     contains "$output" '6.1.0-53-amd64 (inactive) — keep: newest and fallback'
-    contains "$output" '6.1.0-44-amd64 (inactive) — removal candidate via menu 4 → 11'
+    contains "$output" "6.1.0-44-amd64 (inactive) — removal candidate via menu $(menu_path kernel)"
     contains "$output" 'linux-image-6.1.0-53-amd64. Excluded from the removal menu.'
     output=$(MOCK_NO_FALLBACK=1 kernel_check)
     contains "$output" '6.1.0-44-amd64 (inactive) — keep: boot protection could not be verified'
@@ -986,6 +1166,73 @@ if command -v python3 >/dev/null 2>&1; then
     docker_local_write() { fail 'write after menu cancellation'; }
     docker_cleanup_menu <<< $'1\n0\n0' >/dev/null
     docker_cleanup_menu <<< $'2\n0\n0' >/dev/null
+)
+fi
+if has python3; then
+(
+    test_dir=$(mktemp -d)
+    trap 'rm -f -- "$test_dir/rules/app" "$test_dir/rules/bad" "$test_dir/after" "$test_dir/logrotate.conf.before" "$test_dir/history.log" "$test_dir/restore.info"; rmdir -- "$test_dir/rules" "$test_dir"' EXIT
+    mkdir -- "$test_dir/rules"
+    logrotate_rules_directory=$test_dir/rules
+    logrotate_config=$test_dir/rules/app
+    operation_dir=$test_dir
+    logfile=$test_dir/history.log
+    trusted_directory() { return 0; }
+    sync() { return 0; }
+    original=$'# global defaults\nweekly\nrotate 12\n/var/log/one.log {\n    monthly\n    minsize 1M\n    rotate 1\n    postrotate # hook\n        if true; then echo "{ hook }"; fi\n        rotate --shell-argument\n    endscript\n    create 0640 root adm\n}\n/var/log/two.log\n{\n    weekly\n    rotate 4\n}\n'
+    printf '%s' "$original" > "$logrotate_config"
+    inventory=$(logrotate_rule_model list "$logrotate_config")
+    contains "$inventory" $'1\t"/var/log/one.log"'
+    contains "$inventory" $'2\t"/var/log/two.log"'
+    contains "$(logrotate_rule_model show "$logrotate_config" 1)" 'rotate --shell-argument'
+    logrotate_rule_model edit "$logrotate_config" 1 5 2 daily compress > "$test_dir/after"
+    candidate=$(cat "$test_dir/after")
+    contains "$candidate" $'weekly\nrotate 12'
+    contains "$candidate" 'maxsize 5M'
+    contains "$candidate" 'rotate 2'
+    contains "$candidate" 'postrotate # hook'
+    contains "$candidate" 'rotate --shell-argument'
+    contains "$candidate" 'create 0640 root adm'
+    contains "$candidate" $'/var/log/two.log\n{\n    weekly\n    rotate 4\n}'
+    omits "$candidate" 'minsize 1M'
+    # CRLF and the untouched second block must survive editing.
+    printf '/var/log/crlf.log {\r\n weekly\r\n}\r\n' > "$test_dir/rules/bad"
+    logrotate_rule_model edit "$test_dir/rules/bad" 1 2 1 daily keep > "$test_dir/after"
+    contains "$(cat "$test_dir/after")" $'maxsize 2M\r\n'
+    logrotate_rule_model edit "$logrotate_config" 1 5 2 daily compress > "$test_dir/after"
+    if logrotate_rule_model edit "$logrotate_config" 1 '5;rm' 2 daily keep > /dev/null 2>&1; then fail 'accepted invalid editor size'; fi
+    printf '/var/log/inline { daily }\n' > "$test_dir/rules/bad"
+    if logrotate_rule_model list "$test_dir/rules/bad" >/dev/null 2>&1; then fail 'accepted ambiguous inline block'; fi
+    expected=$(file_sha256 "$logrotate_config")
+    approved=$(file_sha256 "$test_dir/after")
+    logrotate() {
+        if [[ ${MOCK_BAD_RULE:-0} == 1 && $(cat "$logrotate_config") == *'maxsize 5M'* ]]; then return 1; fi
+        printf 'reading config file %s\n' "$logrotate_config"
+    }
+    chown() { return 0; }
+    : > "$logfile"
+    if output=$(MOCK_BAD_RULE=1 save_logrotate_rule "$logrotate_config" 1 "$expected" 5 2 daily compress "$approved" 2>&1); then fail 'accepted invalid native validation'; fi
+    [[ $(file_sha256 "$logrotate_config") == "$expected" ]]
+    contains "$output" 'Restored file'
+    printf '# concurrent edit\n' >> "$logrotate_config"
+    if save_logrotate_rule "$logrotate_config" 1 "$expected" 5 2 daily compress "$approved" >/dev/null 2>&1; then fail 'overwrote concurrent rule change'; fi
+    printf '%s' "$original" > "$logrotate_config"
+    # Cancellation must not invoke the history writer or mutate the file.
+    run_logged_maintenance() { fail 'saved editor despite cancellation'; }
+    output=$(edit_logrotate_rules <<< $'1\n5\n2\n1\n1\nn')
+    [[ $(file_sha256 "$logrotate_config") == "$expected" ]]
+    contains "$output" 'maxsize 5M'
+    save_logrotate_rule "$logrotate_config" 1 "$expected" 5 2 daily compress "$approved" >/dev/null
+    [[ $(file_sha256 "$logrotate_config") == "$approved" ]]
+    contains "$(cat "$logfile")" 'maxsize_MiB=5'
+    [[ -f $test_dir/restore.info ]]
+    # The generic descriptor is accepted for the new logrotate kind.
+    printf '\nexit_status=0\n' >> "$logfile"
+    restore_kind= restore_target= restore_backup= restore_before_hash= restore_after_hash= restore_project=
+    load_config_restore "$test_dir"
+    [[ $restore_kind == logrotate && $restore_target == "$logrotate_config" ]]
+    cp -- "$test_dir/logrotate.conf.before" "$test_dir/after"
+    [[ $(file_sha256 "$test_dir/after") == "$expected" ]]
 )
 fi
 printf 'All tests passed.\n'
