@@ -409,6 +409,7 @@ apt-get() {
     case " $* " in
         *' update ') return "${MOCK_APT_FAILURE:-0}" ;;
         *' --no-remove '*' APT::Get::AutomaticRemove=false --with-new-pkgs '*' upgrade ') ;;
+        *' APT::Get::AutomaticRemove=false '*' dist-upgrade ') ;;
         *) fail "unexpected APT call: $*" ;;
     esac
 }
@@ -423,6 +424,13 @@ contains "$output" 'Installation cancelled'
 omits "$output" 'Assume-Yes'
 output=$(apply_update 0 <<< yes)
 contains "$output" 'Assume-Yes=false'
+output=$(apply_update 0 dist-upgrade <<< yes)
+contains "$output" '-s -o APT::Get::AutomaticRemove=false --show-upgraded dist-upgrade'
+contains "$output" 'Assume-Yes=false --show-upgraded dist-upgrade'
+output=$(apply_update 1 dist-upgrade)
+contains "$output" 'apt:noninteractive:-o APT::Get::AutomaticRemove=false -y'
+contains "$output" '--force-confold dist-upgrade'
+omits "$output" '--no-remove'
 unset -f apt-get
 
 (
@@ -625,7 +633,7 @@ contains "$output" '=== 4. Disks and filesystems ==='
 contains "$output" 'Critical issue'
 contains "$output" '/ — total 10 GiB'
 omits "$output" 'Disk critical'
-output=$(menu <<< $'bad\n1\n4\ns\n0\n2\n3\n4\n0\n0')
+output=$(menu <<< $'bad\n1\n4\ns\n0\n2\n1\n3\n4\n0\n0')
 contains "$output" 'Choose an action from the list.'
 contains "$output" '3. Logs and rotation'
 contains "$output" 'test update 0'
@@ -1117,7 +1125,7 @@ if command -v python3 >/dev/null 2>&1; then
 (
     image_id="sha256:$(printf 'a%.0s' {1..64})"
     container_id=$(printf 'b%.0s' {1..64})
-    used=0 removed=0 multi=0 changed=0
+    used=0 removed=0 multi=0 changed=0 untagged=0
     has() { [[ $1 == docker ]] || command -v "$1" >/dev/null 2>&1; }
     docker_local() {
         case "$1 $2" in
@@ -1127,11 +1135,16 @@ if command -v python3 >/dev/null 2>&1; then
                 local tags='["example:latest"]'
                 ((multi)) && tags='["example:latest","example:backup"]'
                 ((changed)) && tags='["example:changed"]'
-                printf '["%s",1048576,%s,[]]\n' "$image_id" "$tags" ;;
+                ((untagged)) && tags='[]'
+                printf '["%s",1048576,%s,[],"2020-01-01T00:00:00.123456789Z"]\n' "$image_id" "$tags" ;;
             'container inspect') printf '["%s","/stopped-app","exited"]\n' "$image_id" ;;
             'system df') printf 'Build cache overview\n' ;;
             *) return 1 ;;
         esac
+    }
+    curl() {
+        [[ $* == *'--unix-socket /var/run/docker.sock http://localhost/system/df' ]] || return 1
+        printf '{"BuildCache":[{"ID":"old","Size":123,"InUse":false,"LastUsedAt":"2020-01-01T00:00:00Z"},{"ID":"active","Size":987,"InUse":true},{"ID":"recent","Size":321,"InUse":false,"LastUsedAt":"%s"}]}\n' "$(date -u +%FT%TZ)"
     }
     docker_local_write() {
         case "$1 $2" in
@@ -1158,14 +1171,26 @@ if command -v python3 >/dev/null 2>&1; then
     remove_docker_image "$snapshot"
     [[ $removed == 1 ]]
     contains "$(cat "$logfile")" "image_id=$image_id"
-    prune_docker_builder 168h
-    if prune_docker_builder 0; then fail 'accepted unrestricted cache filter'; fi
+    cache=$(docker_cache_candidates 168h)
+    contains "$cache" $'old\t123'
+    omits "$cache" active
+    omits "$cache" recent
+    prune_docker_builder 168h "$cache"
+    if prune_docker_builder 0 "$cache"; then fail 'accepted unrestricted cache filter'; fi
     contains "$(cat "$logfile")" 'cache_filter=until=168h'
     # Cancelling either selection must not issue a write.
+    removed=0
+    run_logged_maintenance() { printf 'dispatch=%s\n' "$1"; shift; "$@"; }
+    untagged=1
+    output=$(docker_cleanup_menu <<< $'3\nyes\n0')
+    contains "$output" 'Images older than 7 days eligible for cleanup: 1'
+    contains "$output" 'dispatch=docker-image'
+    contains "$output" "image_deleted=$image_id"
     removed=0
     docker_local_write() { fail 'write after menu cancellation'; }
     docker_cleanup_menu <<< $'1\n0\n0' >/dev/null
     docker_cleanup_menu <<< $'2\n0\n0' >/dev/null
+    docker_cleanup_menu <<< $'3\nn\n0' >/dev/null
 )
 fi
 if has python3; then

@@ -31,7 +31,7 @@ usage() {
     printf '%s\n' "Server Auditor v$VERSION" "$(message 'Использование' 'Usage')" \
         '  bash server-auditor.sh [menu] [--lang ru|en]' \
         '  bash server-auditor.sh [audit] [--format txt|json] [--details] [--lang ru|en]' \
-        '  sudo bash server-auditor.sh update [--yes] [--lang ru|en]' \
+        '  sudo bash server-auditor.sh update [--yes] [--full-upgrade] [--lang ru|en]' \
         '  bash server-auditor.sh --help | --version'
 }
 
@@ -50,6 +50,9 @@ register_menu_item() {
 }
 register_menu_item overview root 1 'Сводка с подробностями по разделам' 'Overview with section details' overview
 register_menu_item update root 2 'Обновить пакеты' 'Update packages' update
+register_menu_item update-review update 1 'Обычное обновление с просмотром плана' 'Review and apply a regular upgrade'
+register_menu_item update-auto update 2 'Обычное обновление без вопросов' 'Run a regular upgrade without prompts'
+register_menu_item update-full update 3 'Полное обновление с просмотром плана' 'Review and apply a full upgrade'
 register_menu_item full-audit root 3 'Подробный аудит системы' 'Detailed system audit' audit
 register_menu_item maintenance root 4 'Обслуживание системы' 'System maintenance'
 register_menu_item cleanup-plan maintenance 1 'План освобождения места' 'Disk space recovery plan' cleanup-plan
@@ -84,6 +87,7 @@ register_menu_item docker-cleanup docker 2 'Очистить образы и к�
 register_menu_item docker-logging-link docker 3 'Настройка журналов Docker' 'Docker log settings' @docker-logs
 register_menu_item docker-images docker-cleanup 1 'Проверить и удалить неиспользуемый образ' 'Review and remove an unused image'
 register_menu_item docker-cache docker-cleanup 2 'Очистить кэш локального Docker Engine' 'Clean local Docker Engine build cache'
+register_menu_item docker-old-images docker-cleanup 3 'Очистить старые образы без тегов' 'Clean old untagged images'
 register_menu_item history history-menu 1 'История операций' 'Operation history' history
 register_menu_item restore-config history-menu 2 'Восстановить конфигурацию' 'Restore a configuration' restore-config
 
@@ -775,7 +779,8 @@ docker_check() {
     if result=$(docker_local image ls -q --filter dangling=true 2>/dev/null); then
         count=$(awk '/^[a-f0-9]+$/ && !seen[$0]++ {n++} END {print n+0}' <<< "$result")
         if (( count )); then record docker WARN "Образы без тегов: $count" "Dangling images: $count" \
-            "Проверить перед удалением: $(menu_path docker-images)" "Review before removal: $(menu_path docker-images)"
+            "Проверить образы: $(menu_path docker-images). Массовая очистка старых образов: $(menu_path docker-old-images)" \
+            "Review images: $(menu_path docker-images). Bulk cleanup of old images: $(menu_path docker-old-images)"
         else record docker OK 'Образы без тегов: 0' 'Dangling images: 0'; fi
     else
         record docker UNKNOWN 'Не удалось посчитать образы без тегов' 'Could not count dangling images'
@@ -794,13 +799,16 @@ docker_check() {
             if ! [[ $reclaim =~ ^[0-9]+([.][0-9]+)?[[:space:]]?[kKMGTPE]?B([[:space:]]\([0-9]+%\))?$ ]]; then
                 reclaim=$(message 'неизвестно' 'unknown')
             fi
-            local hint_ru='' hint_en=''
+            local hint_ru='' hint_en='' level=INFO
             case $type in
                 Images) hint_ru="Проверить образы: $(menu_path docker-images)"; hint_en="Review images: $(menu_path docker-images)" ;;
-                'Build Cache') hint_ru="Очистить кэш встроенного builder: $(menu_path docker-cache)"; hint_en="Clean built-in builder cache: $(menu_path docker-cache)" ;;
+                'Build Cache')
+                    hint_ru="Проверить возраст и очистить кэш сборки: $(menu_path docker-cache)"
+                    hint_en="Review cache age and clean build cache: $(menu_path docker-cache)"
+                    if [[ $reclaim =~ ^[0-9]*[1-9] ]]; then level=WARN; fi ;;
                 *) hint_ru='Автоматическое удаление скриптом не предусмотрено'; hint_en='Automatic removal is not provided' ;;
             esac
-            record docker INFO "$type_ru: объектов $count, активных $active, объём $size, оценка освобождаемого места $reclaim" "$type: records=$count active=$active size=$size reclaimable=$reclaim" "$hint_ru" "$hint_en"
+            record docker "$level" "$type_ru: объектов $count, активных $active, объём $size, оценка освобождаемого места $reclaim" "$type: records=$count active=$active size=$size reclaimable=$reclaim" "$hint_ru" "$hint_en"
             ((rows+=1))
         done <<< "$result"
     fi
@@ -1127,7 +1135,7 @@ audit() {
 }
 
 update() {
-    local automatic=$1 answer
+    local automatic=$1 strategy=${2:-upgrade} answer
     if (( EUID != 0 )); then printf "$(message 'Для обновления нужны права root.\n' 'Update requires root.\n')" >&2; return 1; fi
     case $(os_id) in
         debian|ubuntu|linuxmint) ;;
@@ -1142,22 +1150,28 @@ update() {
         read -r -p "$(message 'Обновить индексы APT и показать план обновления? [д/Н] ' 'Refresh APT indexes and review the upgrade plan? [y/N] ')" answer
         case $answer in y|Y|yes|YES|д|Д|да|Да|ДА) ;; *) printf "$(message 'Отменено.\n' 'Cancelled.\n')"; return 0 ;; esac
     fi
-    run_logged_maintenance update apply_update "$automatic"
+    run_logged_maintenance update apply_update "$automatic" "$strategy"
 }
 
 apply_update() {
-    local automatic=$1 answer
+    local automatic=$1 strategy=${2:-upgrade} answer
+    local -a options=()
+    case $strategy in
+        upgrade) options=("${upgrade_options[@]}") ;;
+        dist-upgrade) options=(-o APT::Get::AutomaticRemove=false) ;;
+        *) return 2 ;;
+    esac
     apt-get -o APT::Update::Error-Mode=any update || return 1
     if (( automatic )); then
         DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l UCF_FORCE_CONFFOLD=1 \
-            apt-get "${upgrade_options[@]}" -y -o Dpkg::Options::=--force-confdef \
-            -o Dpkg::Options::=--force-confold upgrade || return 1
+            apt-get "${options[@]}" -y -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold "$strategy" </dev/null || return 1
     else
-        apt-get -s "${upgrade_options[@]}" --show-upgraded upgrade || return 1
+        apt-get -s "${options[@]}" --show-upgraded "$strategy" || return 1
         read -r -p "$(message 'Установить обновления из плана? [д/Н] ' 'Install the planned upgrades? [y/N] ')" answer
         case $answer in y|Y|yes|YES|д|Д|да|Да|ДА) ;; *) printf "$(message 'Установка отменена.\n' 'Installation cancelled.\n')"; return 0 ;; esac
-        apt-get "${upgrade_options[@]}" -o APT::Get::Assume-Yes=false \
-            --show-upgraded upgrade || return 1
+        apt-get "${options[@]}" -o APT::Get::Assume-Yes=false \
+            --show-upgraded "$strategy" || return 1
     fi
     if [[ -f /run/reboot-required ]]; then printf "$(message 'Требуется перезагрузка. Запланируйте её отдельно.\n' 'Reboot required. Schedule it separately.\n')"; fi
 }
@@ -2453,13 +2467,14 @@ docker_cleanup_inventory() {
     done <<< "$containers"
     if ((${#image_ids[@]})); then
         image_data=$(docker_local image inspect --format \
-            '[{{json .Id}},{{json .Size}},{{json .RepoTags}},{{json .RepoDigests}}]' "${image_ids[@]}") || return 1
+            '[{{json .Id}},{{json .Size}},{{json .RepoTags}},{{json .RepoDigests}},{{json .Created}}]' "${image_ids[@]}") || return 1
     fi
     if ((${#container_ids[@]})); then
         container_data=$(docker_local container inspect --format \
             '[{{json .Image}},{{json .Name}},{{json .State.Status}}]' "${container_ids[@]}") || return 1
     fi
     printf '%s\0%s' "$image_data" "$container_data" | python3 -c '
+from datetime import datetime
 import json, re, sys
 images, containers = sys.stdin.read().split("\0")
 refs = {}
@@ -2468,7 +2483,7 @@ for line in containers.splitlines():
     refs.setdefault(image, []).append([name.lstrip("/"), state])
 rows = {}
 for line in images.splitlines():
-    image, size, tags, digests = json.loads(line)
+    image, size, tags, digests, created = json.loads(line)
     if not re.fullmatch(r"sha256:[a-f0-9]{64}", image) or type(size) is not int or size < 0:
         raise ValueError("Invalid image metadata")
     tags, digests = sorted(tags or []), sorted(digests or [])
@@ -2476,15 +2491,17 @@ for line in images.splitlines():
         raise ValueError("Invalid image references")
     used = sorted(refs.get(image, []))
     eligible = not used and len(tags) <= 1
-    rows[image] = "\t".join([image, str(size), str(int(eligible)), json.dumps(tags, ensure_ascii=True), json.dumps(used, ensure_ascii=True), json.dumps(digests, ensure_ascii=True)])
+    created = re.sub(r"\.\d+(?=Z|[+-]\d{2}:\d{2}$)", "", created or "")
+    timestamp = int(datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()) if created else 0
+    rows[image] = "\t".join([image, str(size), str(int(eligible)), json.dumps(tags, ensure_ascii=True), json.dumps(used, ensure_ascii=True), json.dumps(digests, ensure_ascii=True), str(timestamp)])
 for image in sorted(rows):
     print(rows[image])
 '
 }
 
 remove_docker_image() {
-    local expected=$1 inventory row id size eligible tags refs digests found=0
-    IFS=$'\t' read -r id size eligible tags refs digests <<< "$expected"
+    local expected=$1 inventory row id size eligible tags refs digests created found=0
+    IFS=$'\t' read -r id size eligible tags refs digests created <<< "$expected"
     [[ $id =~ ^sha256:[a-f0-9]{64}$ && $eligible == 1 ]] || return 1
     inventory=$(docker_cleanup_inventory) || return 1
     while IFS= read -r row; do [[ $row == "$expected" ]] && found=1; done <<< "$inventory"
@@ -2492,7 +2509,7 @@ remove_docker_image() {
         message 'Образ изменился или используется. Обновите список.' 'Image changed or is in use. Refresh the list.'
         return 1
     fi
-    printf 'image_id=%s\nimage_tags=%s\nimage_digests=%s\nimage_size_bytes=%s\nbackup=none\n' "$id" "$tags" "$digests" "$size" >> "$logfile" || return 1
+    printf 'image_id=%s\nimage_tags=%s\nimage_digests=%s\nimage_size_bytes=%s\nimage_created_epoch=%s\nbackup=none\n' "$id" "$tags" "$digests" "$size" "$created" >> "$logfile" || return 1
     sync -- "$logfile" || return 1
     docker_local_write image rm --no-prune "$id" || return 1
     inventory=$(docker_cleanup_inventory) || return 1
@@ -2500,23 +2517,59 @@ remove_docker_image() {
     printf 'image_deleted=%s\n' "$id"
 }
 
-prune_docker_builder() {
-    local age=$1
+prune_old_docker_images() {
+    local row
+    for row in "$@"; do remove_docker_image "$row" || return 1; done
+}
+
+docker_cache_candidates() {
+    local age=$1 inventory
     [[ $age == 168h || $age == 720h ]] || return 1
-    printf 'builder=local-engine\ncache_filter=until=%s\n' "$age" >> "$logfile" || return 1
+    has curl && has python3 || return 1
+    inventory=$(curl -q --fail --silent --show-error --max-time 20 --noproxy '*' \
+        --unix-socket /var/run/docker.sock http://localhost/system/df) || return 1
+    python3 -c '
+from datetime import datetime, timedelta, timezone
+import json, re, sys
+
+cutoff = datetime.now(timezone.utc) - timedelta(hours=int(sys.argv[1]))
+records = json.load(sys.stdin)["BuildCache"]
+for record in records or []:
+    if record["InUse"]:
+        continue
+    last_used = record.get("LastUsedAt")
+    if last_used:
+        last_used = re.sub(r"\.\d+(?=Z|[+-]\d{2}:\d{2}$)", "", last_used)
+        parsed = datetime.fromisoformat(last_used.replace("Z", "+00:00"))
+        if parsed > cutoff:
+            continue
+        last_used = parsed.isoformat()
+    cache_id, size = record["ID"], record["Size"]
+    if not re.fullmatch(r"[a-zA-Z0-9_.:-]+", cache_id) or type(size) is not int:
+        raise ValueError("Invalid build cache metadata")
+    print(cache_id, size, last_used or "-", sep="\t")
+' "${age%h}" <<< "$inventory"
+}
+
+prune_docker_builder() {
+    local age=$1 preview=$2
+    [[ $age == 168h || $age == 720h ]] || return 1
+    [[ -n $preview ]] || return 1
+    printf 'builder=local-engine\ncache_filter=until=%s\ncache_preview:\n%s\n' "$age" "$preview" >> "$logfile" || return 1
     sync -- "$logfile" || return 1
     # Keep Docker native confirmation. --force is deliberately not used.
     docker_local_write builder prune --all --filter "until=$age"
 }
 
 docker_cleanup_menu() {
-    local choice inventory row id size eligible tags refs digests number answer age
+    local choice inventory row id size eligible tags refs digests number answer age created cutoff last_used
     local -a rows=()
     has docker || { message 'Docker CLI недоступен.' 'Docker CLI unavailable.'; return 1; }
     while :; do
         printf '\n%s\n' "$(message 'Очистка Docker — локальный сервер' 'Docker cleanup — local engine')" \
             "${menu_number[docker-images]}. $(menu_title docker-images)" \
             "${menu_number[docker-cache]}. $(menu_title docker-cache)" \
+            "${menu_number[docker-old-images]}. $(menu_title docker-old-images)" \
             "$(message '0. Назад' '0. Back')"
         IFS= read -r choice || return 0
         case $choice in
@@ -2527,7 +2580,7 @@ docker_cleanup_menu() {
                 while IFS= read -r row; do
                     [[ -n $row ]] || continue
                     rows+=("$row"); ((number+=1))
-                    IFS=$'\t' read -r id size eligible tags refs digests <<< "$row"
+                    IFS=$'\t' read -r id size eligible tags refs digests created <<< "$row"
                     if [[ $refs != '[]' ]]; then
                         safety_line keep "$number. $tags · ${id:7:12} · $(human_bytes "$size") · $refs"
                     else
@@ -2543,7 +2596,7 @@ docker_cleanup_menu() {
                 [[ -z $choice || $choice == 0 ]] && continue
                 [[ $choice =~ ^[1-9][0-9]{0,5}$ ]] && ((choice <= ${#rows[@]})) || continue
                 row=${rows[choice-1]}
-                IFS=$'\t' read -r id size eligible tags refs digests <<< "$row"
+                IFS=$'\t' read -r id size eligible tags refs digests created <<< "$row"
                 [[ $eligible == 1 ]] || { message 'Удаление заблокировано.' 'Removal blocked.'; continue; }
                 printf '%s\n' "$id · $tags · $digests"
                 message 'Удалить образ без резервной копии? Для восстановления потребуется загрузка или сборка. [д/Н]' \
@@ -2551,16 +2604,47 @@ docker_cleanup_menu() {
                 IFS= read -r answer || return 0
                 case $answer in y|Y|yes|д|Д|да) run_logged_maintenance docker-image remove_docker_image "$row" || return 1 ;; esac ;;
             "${menu_number[docker-cache]}")
-                docker_local system df || return 1
-                message 'Кэш только встроенного builder Docker Engine. Отдельные Buildx builders здесь не очищаются. Оценка Docker может включать общие слои.' \
-                    'Only the Docker Engine built-in builder cache. Separate Buildx builders are not cleaned here. Docker estimates may include shared layers.'
-                message 'Удаление кэша замедлит следующие сборки. 1 — старше 7 дней, 2 — старше 30 дней, 0 — назад:' \
-                    'Cache removal slows subsequent builds. 1 — older than 7 days, 2 — older than 30 days, 0 — back:'
+                printf '%s\n' "$(message 'Срок с последнего использования кэша Docker Engine. 1 — 7 дней, 2 — 30 дней, 0 — назад.' \
+                    'Docker Engine cache age since last use. 1 for 7 days, 2 for 30 days, 0 to go back.')"
                 IFS= read -r choice || return 0
                 case $choice in 1) age=168h ;; 2) age=720h ;; *) continue ;; esac
-                message 'Далее Docker запросит подтверждение. Точный список удаляемого кэша заранее недоступен.' \
-                    'Docker will ask for confirmation. An exact cache deletion preview is unavailable.'
-                run_logged_maintenance docker-cache prune_docker_builder "$age" || return 1 ;;
+                if ! inventory=$(docker_cache_candidates "$age"); then
+                    printf '%s\n' "$(message 'Не удалось проверить кэш через локальный сокет Docker. Проверьте доступ к сокету, curl и Python 3.' \
+                        'Could not inspect cache via the local Docker socket. Check socket access, curl and Python 3.')" >&2
+                    continue
+                fi
+                [[ -n $inventory ]] || { printf '%s\n' "$(message 'Кэш по выбранному критерию не найден.' 'No cache matches the selected period.')"; continue; }
+                printf '%s\n' "$(message 'Кэш к очистке: ID · размер · последнее использование (— если дата отсутствует)' \
+                    'Cache cleanup candidates: ID · size · last use (— when unavailable)')"
+                while IFS=$'\t' read -r id size last_used; do
+                    [[ $last_used != - ]] || last_used=—
+                    if (( size >= 0 )); then size=$(human_bytes "$size"); else size=—; fi
+                    printf '%s · %s · %s\n' "$id" "$size" "$last_used"
+                done <<< "$inventory"
+                printf '%s\n' "$(message 'Docker уточнит состав при очистке и запросит подтверждение. Следующие сборки могут занять больше времени.' \
+                    'Docker will evaluate the live cache and ask for confirmation. Subsequent builds may take longer.')"
+                run_logged_maintenance docker-cache prune_docker_builder "$age" "$inventory" || return 1 ;;
+            "${menu_number[docker-old-images]}")
+                inventory=$(docker_cleanup_inventory) || return 1
+                cutoff=$(date -u +%s) || return 1
+                ((cutoff -= 7 * 24 * 60 * 60))
+                rows=()
+                while IFS= read -r row; do
+                    IFS=$'\t' read -r id size eligible tags refs digests created <<< "$row"
+                    [[ $eligible == 1 && $tags == '[]' && $digests == '[]' ]] || continue
+                    (( created > 0 && created <= cutoff )) || continue
+                    rows+=("$row")
+                done <<< "$inventory"
+                ((${#rows[@]})) || { printf '%s\n' "$(message 'Старых образов для массовой очистки нет.' 'No old images are eligible for bulk cleanup.')"; continue; }
+                printf '%s\n' "$(message "Образы старше 7 дней для очистки: ${#rows[@]}" "Images older than 7 days eligible for cleanup: ${#rows[@]}")"
+                for row in "${rows[@]}"; do
+                    IFS=$'\t' read -r id size eligible tags refs digests created <<< "$row"
+                    printf '%s · %s · %s\n' "$id" "$(human_bytes "$size")" "$(date -u -d "@$created" +%F)"
+                done
+                printf '%s\n' "$(message 'Удалить показанные образы без резервной копии? Размеры включают общие слои. [д/Н]' \
+                    'Remove the listed images without a backup? Sizes include shared layers. [y/N]')"
+                IFS= read -r answer || return 0
+                case $answer in y|Y|yes|д|Д|да) run_logged_maintenance docker-image prune_old_docker_images "${rows[@]}" || return 1 ;; esac ;;
         esac
     done
 }
@@ -3274,6 +3358,34 @@ interactive_overview() {
     done
 }
 
+update_menu() {
+    local choice
+    local -a flags=()
+    printf '\n=== %s ===\n' "$(menu_title update)"
+    for choice in ${menu_items[update]}; do
+        printf '%s. %s\n' "${menu_number[$choice]}" "$(menu_title "$choice")"
+    done
+    printf '%s\n' "$(message '0. Назад' '0. Back')"
+    IFS= read -r choice || return 0
+    case $choice in
+        "${menu_number[update-review]}") ;;
+        "${menu_number[update-auto]}") flags=(--yes) ;;
+        "${menu_number[update-full]}")
+            printf '%s\n' "$(message 'Полное обновление может удалить пакеты. Проверьте план APT перед установкой.' \
+                'A full upgrade may remove packages. Review the APT plan before applying it.')"
+            flags=(--full-upgrade) ;;
+        *) return 0 ;;
+    esac
+    if (( EUID == 0 )); then
+        main update "${flags[@]}"
+    elif has sudo; then
+        sudo -- bash -- "${BASH_SOURCE[0]}" update "${flags[@]}" --lang "$language"
+    else
+        printf '%s\n' "$(message 'Для обновления запустите скрипт от root.' 'Run the script as root to update packages.')" >&2
+        return 1
+    fi
+}
+
 menu() {
     local choice
     while :; do
@@ -3290,14 +3402,7 @@ menu() {
             "${menu_number[full-audit]}") details=1 audit ;;
             "${menu_number[maintenance]}") maintenance_menu ;;
             "${menu_number[update]}")
-                if (( EUID == 0 )); then
-                    update 0 || printf '%s\n' "$(message 'Обновление завершилось ошибкой.' 'Update failed.')" >&2
-                elif has sudo; then
-                    sudo -- bash -- "${BASH_SOURCE[0]}" update --lang "$language" ||
-                        printf '%s\n' "$(message 'Обновление завершилось ошибкой.' 'Update failed.')" >&2
-                else
-                    printf '%s\n' "$(message 'Для обновления запустите скрипт от root.' 'Run the script as root to update packages.')" >&2
-                fi ;;
+                update_menu || printf '%s\n' "$(message 'Обновление завершилось ошибкой.' 'Update failed.')" >&2 ;;
             0) return 0 ;;
             *) printf '%s\n' "$(message 'Выберите действие из списка.' 'Choose an action from the list.')" ;;
         esac
@@ -3306,6 +3411,7 @@ menu() {
 
 main() {
     local -a args=()
+    local automatic=0 strategy=upgrade arg
     while (( $# )); do
         if [[ $1 == --lang ]]; then
             case ${2:-} in ru|en) language=$2 ;; *) usage >&2; return 2 ;; esac
@@ -3337,11 +3443,14 @@ main() {
             maintenance_action "$@"; return ;;
         update)
             shift
-            case $#:${1:-} in
-                0:) update 0 ;;
-                1:--yes) update 1 ;;
-                *) usage >&2; return 2 ;;
-            esac
+            for arg in "$@"; do
+                case $arg in
+                    --yes) (( ! automatic )) || { usage >&2; return 2; }; automatic=1 ;;
+                    --full-upgrade) [[ $strategy == upgrade ]] || { usage >&2; return 2; }; strategy=dist-upgrade ;;
+                    *) usage >&2; return 2 ;;
+                esac
+            done
+            update "$automatic" "$strategy"
             return ;;
         audit) shift ;;
     esac
